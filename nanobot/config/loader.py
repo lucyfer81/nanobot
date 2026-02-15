@@ -125,6 +125,8 @@ def _apply_env_overrides(config: Config) -> None:
     - SILICONFLOW_API_BASE    -> providers.vllm.api_base
     - SILICONFLOW_MODEL_MAIN  -> agents.defaults.model
     - SILICONFLOW_MODEL       -> agents.defaults.model
+    - BRAVE_API_KEY           -> tools.web.search.api_key
+    - BRAVE_SEARCH_API_KEY    -> tools.web.search.api_key
     """
     env = _collect_env()
 
@@ -147,6 +149,14 @@ def _apply_env_overrides(config: Config) -> None:
     ).strip()
     if siliconflow_model:
         config.agents.defaults.model = siliconflow_model
+
+    brave_api_key = (
+        env.get("BRAVE_API_KEY")
+        or env.get("BRAVE_SEARCH_API_KEY")
+        or ""
+    ).strip()
+    if brave_api_key:
+        config.tools.web.search.api_key = brave_api_key
 
 
 def convert_keys(data: Any) -> Any:
