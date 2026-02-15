@@ -9,6 +9,7 @@ from litellm import acompletion
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
+from nanobot.infra.error_types import NanobotRuntimeError, classify_error
 
 
 class LiteLLMProvider(LLMProvider):
@@ -152,11 +153,13 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
+            # Classify error and raise structured error type
+            info = classify_error(str(e))
+            raise NanobotRuntimeError(
+                kind=info.kind,
+                message=str(e),
+                retry_after_seconds=info.retry_after_seconds,
+            ) from e
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

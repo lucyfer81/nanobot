@@ -171,6 +171,12 @@ class AgentDefaults(BaseModel):
     tool_result_max_chars: int = 12000
     tool_result_max_ratio: float = 0.10
     tool_result_truncation_notice: bool = True
+    # PR-04: Outcome-driven execution limits
+    max_turns_per_request: int = 12
+    max_recovery_attempts: int = 4
+    max_transient_retries: int = 1
+    max_context_recoveries: int = 2
+    enable_model_fallback: bool = False
 
 
 class AgentsConfig(BaseModel):

@@ -33,6 +33,7 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.infra.error_types import NanobotRuntimeError, classify_error
 from nanobot.infra.retry import RetryPolicy, run_with_retry
+from nanobot.agent.outcome import RunOutcome, RunOutcomeKind, RecoveryAction
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -80,6 +81,12 @@ class AgentLoop:
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        # PR-04: Outcome-driven execution limits
+        max_turns_per_request: int = 12,
+        max_recovery_attempts: int = 4,
+        max_transient_retries: int = 1,
+        max_context_recoveries: int = 2,
+        enable_model_fallback: bool = False,
     ):
         from nanobot.config.schema import ExecToolConfig as RuntimeExecToolConfig
 
@@ -126,8 +133,14 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
         self.followup_queue = FollowupQueue(debounce_ms=self.followup_debounce_ms)
-        self.context_recovery_max_retries = 2
+        self.context_recovery_max_retries = max_context_recoveries
         self.context_compaction_keep_tail = 8
+        # PR-04: Outcome-driven execution limits
+        self.max_turns_per_request = max(1, max_turns_per_request)
+        self.max_recovery_attempts = max(1, max_recovery_attempts)
+        self.max_transient_retries = max(0, max_transient_retries)
+        self.max_context_recoveries = max(0, max_context_recoveries)
+        self.enable_model_fallback = enable_model_fallback
 
         self._running = False
         self._session_tasks: set[asyncio.Task[None]] = set()
@@ -350,13 +363,173 @@ class AgentLoop:
             on_retry=_on_retry,
         )
 
+    def _apply_recovery(
+        self,
+        outcome: RunOutcome,
+        context_retries: int,
+        transient_retries: int,
+        messages: list[dict],
+    ) -> tuple[RecoveryAction, int, int]:
+        """
+        Decide recovery action based on outcome and retry budgets.
+
+        Returns:
+            Tuple of (RecoveryAction, updated_context_retries, updated_transient_retries).
+        """
+        if outcome.is_terminal():
+            return RecoveryAction.stop_no_action(), context_retries, transient_retries
+
+        if outcome.kind == RunOutcomeKind.RETRYABLE_ERROR:
+            error_kind = outcome.diagnostics.get("error_kind")
+            if error_kind == "context_overflow":
+                if context_retries < self.max_context_recoveries:
+                    return RecoveryAction.retry_with_compacted_context(), context_retries + 1, transient_retries
+            elif error_kind in {"transient_http", "rate_limit", "timeout"}:
+                if transient_retries < self.max_transient_retries:
+                    return RecoveryAction.retry_same(), context_retries, transient_retries + 1
+
+            # Retry budget exhausted
+            return RecoveryAction.stop_with_message(outcome.payload or "Recovery budget exhausted."), context_retries, transient_retries
+
+        # Should not reach here for other outcome kinds
+        return RecoveryAction.stop_no_action(), context_retries, transient_retries
+
+    async def _run_turn(
+        self,
+        messages: list[dict],
+        session_key: str | None = None,
+        turn_number: int = 1,
+        tools_used: list[str] | None = None,
+    ) -> tuple[RunOutcome, list[dict]]:
+        """
+        Execute a single agent turn and return outcome with updated messages.
+
+        Returns:
+            Tuple of (RunOutcome, updated_messages).
+        """
+        if tools_used is None:
+            tools_used = []
+
+        available_limit = self._compute_available_context_limit()
+        messages, pruned_count = self._apply_runtime_token_pruning(messages, available_limit)
+        used_tokens = estimate_message_tokens(messages)
+        pressure = evaluate_context_pressure(
+            used=used_tokens,
+            limit=available_limit,
+            warn_ratio=self.context_guard_warn_ratio,
+            block_ratio=self.context_guard_block_ratio,
+        )
+
+        log_ctx = {
+            "session": session_key or "unknown",
+            "model": self.model,
+            "turn": turn_number,
+            "used": used_tokens,
+            "limit": available_limit,
+        }
+
+        if pruned_count > 0:
+            logger.bind(**log_ctx).warning("Token pruning removed {} message(s) before provider call", pruned_count)
+        if pressure == "warn":
+            logger.bind(**log_ctx).warning("Context pressure warning")
+        elif pressure == "block":
+            return RunOutcome(
+                kind=RunOutcomeKind.RETRYABLE_ERROR,
+                payload=(
+                    "Context window is near capacity and automatic compaction could not recover. "
+                    "Please send a shorter follow-up or start a new session with /new."
+                ),
+                reason="Context pressure block",
+                diagnostics={"error_kind": "context_overflow"},
+            ), messages
+
+        try:
+            response = await self._chat_with_retry(
+                messages=messages,
+                session_key=session_key,
+            )
+        except Exception as exc:
+            info = classify_error(exc)
+            logger.warning(
+                "Provider call failed after retries: session={} kind={} error={}",
+                session_key or "unknown",
+                info.kind,
+                info.message[:300],
+            )
+            return RunOutcome(
+                kind=RunOutcomeKind.RETRYABLE_ERROR if info.kind in {"context_overflow", "transient_http", "rate_limit", "timeout"} else RunOutcomeKind.FATAL_ERROR,
+                payload=None,
+                reason=f"Provider error: {info.kind}",
+                diagnostics={"error_kind": info.kind, "error_message": info.message[:300]},
+            ), messages
+
+        if response.has_tool_calls:
+            tool_call_dicts = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments)
+                    }
+                }
+                for tc in response.tool_calls
+            ]
+            messages = self.context.add_assistant_message(
+                messages, response.content, tool_call_dicts,
+                reasoning_content=response.reasoning_content,
+            )
+
+            for tool_call in response.tool_calls:
+                tools_used.append(tool_call.name)
+                args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                result_text = result if isinstance(result, str) else str(result)
+                hard_limit = compute_tool_result_limit(
+                    limit=available_limit,
+                    ratio=self.tool_result_max_ratio,
+                    max_chars=self.tool_result_max_chars,
+                )
+                truncated_result, was_truncated = truncate_tool_result(
+                    result_text,
+                    hard_limit=hard_limit,
+                )
+                truncation_notice = None
+                if was_truncated and self.tool_result_truncation_notice:
+                    truncation_notice = format_truncation_notice(
+                        original_len=len(result_text),
+                        kept_len=len(truncated_result),
+                    )
+                messages = self.context.add_tool_result(
+                    messages,
+                    tool_call.id,
+                    tool_call.name,
+                    truncated_result,
+                    truncation_notice=truncation_notice,
+                )
+
+            # Tool calls executed successfully - continue to next turn
+            return RunOutcome(
+                kind=RunOutcomeKind.NEEDS_FOLLOWUP,
+                payload=None,
+                reason="Tool calls executed, awaiting next iteration",
+            ), messages
+        else:
+            # No tool calls - terminal success
+            return RunOutcome(
+                kind=RunOutcomeKind.SUCCESS,
+                payload=response.content,
+                reason="LLM response without tool calls",
+            ), messages
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         session_key: str | None = None,
     ) -> tuple[str | None, list[str]]:
         """
-        Run the agent iteration loop.
+        Run the agent iteration loop using outcome-driven state machine.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
@@ -366,161 +539,78 @@ class AgentLoop:
             Tuple of (final_content, list_of_tools_used).
         """
         messages = initial_messages
-        iteration = 0
-        final_content = None
+        turn_number = 0
         tools_used: list[str] = []
         context_retries = 0
+        transient_retries = 0
+        final_outcome: RunOutcome | None = None
 
-        while iteration < self.max_iterations:
-            iteration += 1
+        while turn_number < self.max_turns_per_request:
+            turn_number += 1
 
-            available_limit = self._compute_available_context_limit()
-            messages, pruned_count = self._apply_runtime_token_pruning(messages, available_limit)
-            used_tokens = estimate_message_tokens(messages)
-            pressure = evaluate_context_pressure(
-                used=used_tokens,
-                limit=available_limit,
-                warn_ratio=self.context_guard_warn_ratio,
-                block_ratio=self.context_guard_block_ratio,
+            outcome, messages = await self._run_turn(
+                messages=messages,
+                session_key=session_key,
+                turn_number=turn_number,
+                tools_used=tools_used,
             )
 
-            log_ctx = {
-                "session": session_key or "unknown",
-                "model": self.model,
-                "used": used_tokens,
-                "limit": available_limit,
-            }
-            if pruned_count > 0:
-                logger.bind(
-                    **log_ctx,
-                    retry=context_retries,
-                    compacted=True,
-                ).warning("Token pruning removed {} message(s) before provider call", pruned_count)
-            if pressure == "warn":
-                logger.bind(
-                    **log_ctx,
-                    retry=context_retries,
-                    compacted=False,
-                ).warning("Context pressure warning")
-            elif pressure == "block":
-                can_retry = context_retries < self.context_recovery_max_retries
-                compacted_messages: list[dict] | None = None
-                compacted_count = 0
-                if can_retry:
-                    compacted_messages, compacted_count = self._compact_context_messages(messages)
-                if can_retry and compacted_messages is not None and compacted_count > 0:
-                    context_retries += 1
-                    messages = compacted_messages
-                    logger.bind(
-                        **log_ctx,
-                        retry=context_retries,
-                        compacted=True,
-                    ).warning("Context pressure block: compacted history and retrying")
-                    continue
+            recovery, context_retries, transient_retries = self._apply_recovery(
+                outcome=outcome,
+                context_retries=context_retries,
+                transient_retries=transient_retries,
+                messages=messages,
+            )
 
-                logger.bind(
-                    **log_ctx,
-                    retry=context_retries,
-                    compacted=False,
-                ).warning("Context pressure block: recovery exhausted")
-                final_content = (
-                    "Context window is near capacity and automatic compaction could not recover. "
-                    "Please send a shorter follow-up or start a new session with /new."
-                )
+            if outcome.is_terminal():
+                final_outcome = outcome
                 break
 
-            try:
-                response = await self._chat_with_retry(
-                    messages=messages,
-                    session_key=session_key,
-                )
-            except Exception as exc:
-                info = classify_error(exc)
-                logger.warning(
-                    "Provider call failed after retries: session={} kind={} error={}",
-                    session_key or "unknown",
-                    info.kind,
-                    info.message[:300],
-                )
-                if info.kind == "context_overflow":
-                    can_retry = context_retries < self.context_recovery_max_retries
-                    compacted_messages: list[dict] | None = None
-                    compacted_count = 0
-                    if can_retry:
-                        compacted_messages, compacted_count = self._compact_context_messages(messages)
-                    if can_retry and compacted_messages is not None and compacted_count > 0:
-                        context_retries += 1
-                        messages = compacted_messages
-                        logger.bind(
-                            **log_ctx,
-                            retry=context_retries,
-                            compacted=True,
-                        ).warning("Provider context overflow: compacted history and retrying")
-                        continue
-                    final_content = (
-                        "Context exceeded provider limits and automatic compaction could not recover. "
-                        "Please send a shorter follow-up or start a new session with /new."
-                    )
-                elif info.kind in {"transient_http", "rate_limit", "timeout"}:
-                    final_content = (
-                        "The model service is temporarily unavailable after retries. "
-                        "Please try again in a moment."
-                    )
-                else:
-                    final_content = "Sorry, I encountered an unrecoverable model error."
-                break
-
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    result_text = result if isinstance(result, str) else str(result)
-                    hard_limit = compute_tool_result_limit(
-                        limit=available_limit,
-                        ratio=self.tool_result_max_ratio,
-                        max_chars=self.tool_result_max_chars,
-                    )
-                    truncated_result, was_truncated = truncate_tool_result(
-                        result_text,
-                        hard_limit=hard_limit,
-                    )
-                    truncation_notice = None
-                    if was_truncated and self.tool_result_truncation_notice:
-                        truncation_notice = format_truncation_notice(
-                            original_len=len(result_text),
-                            kept_len=len(truncated_result),
+            if recovery.should_retry:
+                if recovery.retry_with_compaction:
+                    compacted = self._compact_context_messages(messages)
+                    if compacted[0] is not None:
+                        messages = compacted[0]
+                        logger.info(f"Turn {turn_number}: retrying with compacted context")
+                    else:
+                        # Compaction failed, stop
+                        final_outcome = RunOutcome(
+                            kind=RunOutcomeKind.FATAL_ERROR,
+                            payload="Context compaction failed",
+                            reason="Could not compact messages",
                         )
-                    messages = self.context.add_tool_result(
-                        messages,
-                        tool_call.id,
-                        tool_call.name,
-                        truncated_result,
-                        truncation_notice=truncation_notice,
-                    )
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
-            else:
-                final_content = response.content
+                        break
+                else:
+                    logger.info(f"Turn {turn_number}: retrying without compaction")
+                continue
+
+            if recovery.fallback_message:
+                final_outcome = RunOutcome(
+                    kind=RunOutcomeKind.FATAL_ERROR,
+                    payload=recovery.fallback_message,
+                    reason="Recovery action requested stop",
+                )
                 break
 
-        return final_content, tools_used
+            # Should not reach here if logic is correct
+            final_outcome = outcome
+            break
+
+        if final_outcome is None:
+            final_outcome = RunOutcome(
+                kind=RunOutcomeKind.NO_REPLY,
+                payload=None,
+                reason="Max turns reached without terminal outcome",
+            )
+
+        # Extract final content from outcome
+        if final_outcome.kind == RunOutcomeKind.SUCCESS:
+            return final_outcome.payload, tools_used
+        elif final_outcome.payload:
+            return final_outcome.payload, tools_used
+        else:
+            return None, tools_used
+
 
     def _on_session_task_done(self, task: asyncio.Task[None]) -> None:
         """Handle completion of one session worker task."""

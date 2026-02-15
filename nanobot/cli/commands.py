@@ -354,6 +354,12 @@ def gateway(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        # PR-04: Outcome-driven execution limits
+        max_turns_per_request=config.agents.defaults.max_turns_per_request,
+        max_recovery_attempts=config.agents.defaults.max_recovery_attempts,
+        max_transient_retries=config.agents.defaults.max_transient_retries,
+        max_context_recoveries=config.agents.defaults.max_context_recoveries,
+        enable_model_fallback=config.agents.defaults.enable_model_fallback,
     )
     
     # Set cron callback (needs agent)
@@ -469,6 +475,12 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        # PR-04: Outcome-driven execution limits
+        max_turns_per_request=config.agents.defaults.max_turns_per_request,
+        max_recovery_attempts=config.agents.defaults.max_recovery_attempts,
+        max_transient_retries=config.agents.defaults.max_transient_retries,
+        max_context_recoveries=config.agents.defaults.max_context_recoveries,
+        enable_model_fallback=config.agents.defaults.enable_model_fallback,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
