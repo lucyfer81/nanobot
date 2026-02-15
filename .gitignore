@@ -19,4 +19,8 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
-tests/
+tests/*
+!tests/test_session_atomic_save.py
+!tests/test_session_locking.py
+!tests/test_session_repair.py
+nanobot_upgradeplan.md

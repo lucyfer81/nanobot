@@ -1,7 +1,9 @@
 """Test session management with cache-friendly message handling."""
 
-import pytest
 from pathlib import Path
+
+import pytest
+
 from nanobot.session.manager import Session, SessionManager
 
 # Test constants
@@ -63,7 +65,7 @@ class TestSessionLastConsolidated:
 
     def test_last_consolidated_persistence(self, tmp_path) -> None:
         """Test that last_consolidated persists across save/load."""
-        manager = SessionManager(Path(tmp_path))
+        manager = SessionManager(Path(tmp_path), sessions_dir=Path(tmp_path), auto_repair=False)
         session1 = create_session_with_messages("test:persist", 20)
         session1.last_consolidated = 15
         manager.save(session1)
@@ -143,7 +145,7 @@ class TestSessionPersistence:
 
     @pytest.fixture
     def temp_manager(self, tmp_path):
-        return SessionManager(Path(tmp_path))
+        return SessionManager(Path(tmp_path), sessions_dir=Path(tmp_path), auto_repair=False)
 
     def test_persistence_roundtrip(self, temp_manager):
         """Test that messages persist across save/load."""
