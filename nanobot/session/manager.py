@@ -50,9 +50,25 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Get recent messages in LLM format (role + content only)."""
-        return [{"role": m["role"], "content": m["content"]} for m in self.messages[-max_messages:]]
+    def get_history(
+        self,
+        max_messages: int = 500,
+        max_tokens: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get recent messages in LLM format, optionally token-pruned."""
+        history = [{"role": m["role"], "content": m["content"]} for m in self.messages[-max_messages:]]
+        if max_tokens is None or max_tokens <= 0:
+            return history
+
+        from nanobot.agent.context_guard import prune_messages_by_tokens
+
+        pruned, _ = prune_messages_by_tokens(
+            history,
+            budget_tokens=max_tokens,
+            min_messages=2,
+            prioritize_tool_messages=True,
+        )
+        return pruned
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

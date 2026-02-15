@@ -12,8 +12,8 @@ def test_estimate_message_tokens_grows_with_payload() -> None:
     assert estimate_message_tokens(large) > estimate_message_tokens(small)
 
 
-def test_compute_context_limit_prefers_configured_value() -> None:
-    assert compute_context_limit("anthropic/claude-opus-4-5", 8192) == 8192
+def test_compute_context_limit_prefers_configured_context_window() -> None:
+    assert compute_context_limit("anthropic/claude-opus-4-5", 96_000) == 96_000
 
 
 def test_compute_context_limit_uses_model_hint_without_config() -> None:

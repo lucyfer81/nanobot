@@ -53,26 +53,35 @@ class HugeTool(Tool):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_loop_blocks_before_provider_call(tmp_path: Path) -> None:
-    provider = StubProvider([LLMResponse(content="should not be called")])
+async def test_run_agent_loop_compacts_then_calls_provider_on_block(tmp_path: Path) -> None:
+    provider = StubProvider([LLMResponse(content="recovered")])
     agent = AgentLoop(
         bus=MessageBus(),
         provider=provider,
         workspace=tmp_path,
-        max_tokens=100,
+        max_tokens=256,
+        context_window_tokens=1000,
         context_guard_warn_ratio=0.8,
         context_guard_block_ratio=0.9,
         context_reserve_tokens=0,
     )
 
-    # ~750 tokens by heuristic, above block threshold (90 tokens).
-    initial_messages = [{"role": "system", "content": "X" * 3000}]
+    initial_messages: list[dict[str, Any]] = [{"role": "system", "content": "system"}]
+    for i in range(20):
+        role = "user" if i % 2 == 0 else "assistant"
+        initial_messages.append({"role": role, "content": f"msg{i} " + ("X" * 1600)})
     final_content, tools_used = await agent._run_agent_loop(initial_messages, session_key="test:block")
 
-    assert provider.calls == 0
+    assert provider.calls == 1
     assert tools_used == []
-    assert final_content is not None
-    assert "Context window is near capacity" in final_content
+    assert final_content == "recovered"
+    compacted_messages = provider.captured_messages[0]
+    assert any(
+        m.get("role") == "system"
+        and isinstance(m.get("content"), str)
+        and m["content"].startswith("[context compacted]")
+        for m in compacted_messages
+    )
 
 
 @pytest.mark.asyncio

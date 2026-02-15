@@ -18,6 +18,7 @@ from nanobot.agent.context_guard import (
     compute_tool_result_limit,
     estimate_message_tokens,
     evaluate_context_pressure,
+    prune_messages_by_tokens,
 )
 from nanobot.agent.tool_result_truncation import format_truncation_notice, truncate_tool_result
 from nanobot.agent.followup_queue import FollowupQueue
@@ -60,10 +61,12 @@ class AgentLoop:
         max_iterations: int = 20,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        context_window_tokens: int = 96000,
         memory_window: int = 50,
         context_guard_warn_ratio: float = 0.80,
         context_guard_block_ratio: float = 0.90,
         context_reserve_tokens: int = 2000,
+        history_budget_ratio: float = 0.60,
         tool_result_max_chars: int = 12000,
         tool_result_max_ratio: float = 0.10,
         tool_result_truncation_notice: bool = True,
@@ -87,10 +90,12 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.context_window_tokens = context_window_tokens
         self.memory_window = memory_window
         self.context_guard_warn_ratio = context_guard_warn_ratio
         self.context_guard_block_ratio = context_guard_block_ratio
         self.context_reserve_tokens = context_reserve_tokens
+        self.history_budget_ratio = max(0.0, min(1.0, history_budget_ratio))
         self.tool_result_max_chars = tool_result_max_chars
         self.tool_result_max_ratio = tool_result_max_ratio
         self.tool_result_truncation_notice = tool_result_truncation_notice
@@ -121,6 +126,8 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
         self.followup_queue = FollowupQueue(debounce_ms=self.followup_debounce_ms)
+        self.context_recovery_max_retries = 2
+        self.context_compaction_keep_tail = 8
 
         self._running = False
         self._session_tasks: set[asyncio.Task[None]] = set()
@@ -192,6 +199,114 @@ class AgentLoop:
             )
         return None
 
+    @staticmethod
+    def _stringify_message_content(content: object) -> str:
+        """Render arbitrary message content into compact plain text."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False, default=str)
+        except Exception:
+            return str(content)
+
+    def _build_compaction_summary(self, messages: list[dict]) -> str:
+        """Build a compact summary from dropped context messages."""
+        if not messages:
+            return ""
+
+        snippets: list[str] = []
+        for msg in messages[-12:]:
+            role = str(msg.get("role") or "unknown")
+            content = self._stringify_message_content(msg.get("content"))
+            content = " ".join(content.split())
+            if len(content) > 180:
+                content = f"{content[:177]}..."
+            if role == "tool":
+                tool_name = msg.get("name") or "tool"
+                snippets.append(f"- {role}:{tool_name}: {content}")
+            else:
+                snippets.append(f"- {role}: {content}")
+
+        if not snippets:
+            return ""
+        return "Compacted context summary:\n" + "\n".join(snippets)
+
+    def _compact_context_messages(self, messages: list[dict]) -> tuple[list[dict] | None, int]:
+        """Compact older messages into one synthetic summary block."""
+        if not messages:
+            return None, 0
+
+        has_system = messages[0].get("role") == "system"
+        system_message = messages[0] if has_system else None
+        body = messages[1:] if has_system else messages
+        if len(body) < 3:
+            return None, 0
+
+        keep_tail = min(max(2, self.context_compaction_keep_tail), len(body) - 1)
+        if keep_tail <= 0:
+            return None, 0
+
+        dropped = body[:-keep_tail]
+        kept = body[-keep_tail:]
+        summary = self._build_compaction_summary(dropped)
+        if not summary:
+            return None, 0
+
+        rebuilt = [system_message] if system_message else []
+        rebuilt.extend(kept)
+        rebuilt = self.context.inject_compaction_summary(
+            rebuilt,
+            summary=summary,
+            compacted_count=len(dropped),
+        )
+        return rebuilt, len(dropped)
+
+    def _compute_available_context_limit(self) -> int:
+        """Compute usable token limit after reserve."""
+        context_limit = compute_context_limit(self.model, self.context_window_tokens)
+        return max(1, context_limit - self.context_reserve_tokens)
+
+    def _compute_history_budget_tokens(self) -> int:
+        """Compute history token budget from available context and configured ratio."""
+        available_limit = self._compute_available_context_limit()
+        ratio = self.history_budget_ratio if self.history_budget_ratio > 0 else 1.0
+        return max(1, int(available_limit * ratio))
+
+    def _apply_runtime_token_pruning(
+        self,
+        messages: list[dict],
+        available_limit: int,
+    ) -> tuple[list[dict], int]:
+        """
+        Prune runtime message list to fit budget.
+
+        Keeps the first system prompt separate so pruning focuses on conversation
+        history/tool outputs, prioritizing old tool messages first.
+        """
+        if not messages:
+            return messages, 0
+
+        if messages[0].get("role") != "system":
+            return prune_messages_by_tokens(
+                messages,
+                budget_tokens=available_limit,
+                min_messages=3,
+                prioritize_tool_messages=True,
+            )
+
+        system_message = messages[0]
+        system_tokens = estimate_message_tokens([system_message])
+        remaining_budget = max(1, available_limit - system_tokens)
+        pruned_tail, removed = prune_messages_by_tokens(
+            messages[1:],
+            budget_tokens=remaining_budget,
+            min_messages=3,
+            prioritize_tool_messages=True,
+        )
+        return [system_message, *pruned_tail], removed
+
     async def _chat_with_retry(
         self,
         *,
@@ -254,12 +369,13 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        context_retries = 0
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            context_limit = compute_context_limit(self.model, self.max_tokens)
-            available_limit = max(1, context_limit - self.context_reserve_tokens)
+            available_limit = self._compute_available_context_limit()
+            messages, pruned_count = self._apply_runtime_token_pruning(messages, available_limit)
             used_tokens = estimate_message_tokens(messages)
             pressure = evaluate_context_pressure(
                 used=used_tokens,
@@ -274,12 +390,41 @@ class AgentLoop:
                 "used": used_tokens,
                 "limit": available_limit,
             }
+            if pruned_count > 0:
+                logger.bind(
+                    **log_ctx,
+                    retry=context_retries,
+                    compacted=True,
+                ).warning("Token pruning removed {} message(s) before provider call", pruned_count)
             if pressure == "warn":
-                logger.bind(**log_ctx).warning("Context pressure warning")
+                logger.bind(
+                    **log_ctx,
+                    retry=context_retries,
+                    compacted=False,
+                ).warning("Context pressure warning")
             elif pressure == "block":
-                logger.bind(**log_ctx).warning("Context pressure block: skip provider call")
+                can_retry = context_retries < self.context_recovery_max_retries
+                compacted_messages: list[dict] | None = None
+                compacted_count = 0
+                if can_retry:
+                    compacted_messages, compacted_count = self._compact_context_messages(messages)
+                if can_retry and compacted_messages is not None and compacted_count > 0:
+                    context_retries += 1
+                    messages = compacted_messages
+                    logger.bind(
+                        **log_ctx,
+                        retry=context_retries,
+                        compacted=True,
+                    ).warning("Context pressure block: compacted history and retrying")
+                    continue
+
+                logger.bind(
+                    **log_ctx,
+                    retry=context_retries,
+                    compacted=False,
+                ).warning("Context pressure block: recovery exhausted")
                 final_content = (
-                    "Context window is near capacity, so I paused before calling the model. "
+                    "Context window is near capacity and automatic compaction could not recover. "
                     "Please send a shorter follow-up or start a new session with /new."
                 )
                 break
@@ -298,8 +443,22 @@ class AgentLoop:
                     info.message[:300],
                 )
                 if info.kind == "context_overflow":
+                    can_retry = context_retries < self.context_recovery_max_retries
+                    compacted_messages: list[dict] | None = None
+                    compacted_count = 0
+                    if can_retry:
+                        compacted_messages, compacted_count = self._compact_context_messages(messages)
+                    if can_retry and compacted_messages is not None and compacted_count > 0:
+                        context_retries += 1
+                        messages = compacted_messages
+                        logger.bind(
+                            **log_ctx,
+                            retry=context_retries,
+                            compacted=True,
+                        ).warning("Provider context overflow: compacted history and retrying")
+                        continue
                     final_content = (
-                        "Context exceeded provider limits, so I paused before continuing. "
+                        "Context exceeded provider limits and automatic compaction could not recover. "
                         "Please send a shorter follow-up or start a new session with /new."
                     )
                 elif info.kind in {"transient_http", "rate_limit", "timeout"}:
@@ -486,8 +645,12 @@ class AgentLoop:
             asyncio.create_task(self._consolidate_memory(session))
 
         self._set_tool_context(msg.channel, msg.chat_id)
+        history_budget_tokens = self._compute_history_budget_tokens()
         initial_messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.memory_window),
+            history=session.get_history(
+                max_messages=self.memory_window,
+                max_tokens=history_budget_tokens,
+            ),
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -535,8 +698,12 @@ class AgentLoop:
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
         self._set_tool_context(origin_channel, origin_chat_id)
+        history_budget_tokens = self._compute_history_budget_tokens()
         initial_messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.memory_window),
+            history=session.get_history(
+                max_messages=self.memory_window,
+                max_tokens=history_budget_tokens,
+            ),
             current_message=msg.content,
             channel=origin_channel,
             chat_id=origin_chat_id,

@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 
-DEFAULT_CONTEXT_LIMIT = 8192
+DEFAULT_CONTEXT_LIMIT = 96_000
 _CHARS_PER_TOKEN = 4
 
 # Conservative model context hints used only when no explicit limit is configured.
@@ -45,10 +45,10 @@ def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
     return total + 2  # Reply priming overhead.
 
 
-def compute_context_limit(model: str, configured_max_tokens: int | None) -> int:
+def compute_context_limit(model: str, configured_context_window_tokens: int | None) -> int:
     """Compute usable context limit from explicit config or model hint."""
-    if configured_max_tokens is not None and configured_max_tokens > 0:
-        return configured_max_tokens
+    if configured_context_window_tokens is not None and configured_context_window_tokens > 0:
+        return configured_context_window_tokens
 
     model_lower = (model or "").lower()
     for keyword, limit in _MODEL_CONTEXT_HINTS:
@@ -92,6 +92,67 @@ def compute_tool_result_limit(limit: int, ratio: float, max_chars: int) -> int:
         return 1
 
     return max(1, min(max_chars, ratio_cap))
+
+
+def prune_messages_by_tokens(
+    messages: list[dict[str, Any]],
+    budget_tokens: int,
+    *,
+    min_messages: int = 1,
+    prioritize_tool_messages: bool = True,
+) -> tuple[list[dict[str, Any]], int]:
+    """
+    Prune oldest messages until estimated token usage fits the budget.
+
+    Strategy:
+    1. Drop older tool messages first.
+    2. Then drop older non-tool messages.
+    """
+    if not messages:
+        return [], 0
+
+    budget = max(1, budget_tokens)
+    message_tokens = [estimate_message_tokens([msg]) for msg in messages]
+    total = sum(message_tokens)
+    if total <= budget:
+        return list(messages), 0
+
+    keep = [True] * len(messages)
+    keep_count = len(messages)
+    min_keep = max(0, min(min_messages, len(messages)))
+
+    def _try_drop(index: int) -> None:
+        nonlocal total, keep_count
+        if not keep[index]:
+            return
+        if keep_count <= min_keep:
+            return
+        keep[index] = False
+        keep_count -= 1
+        total -= message_tokens[index]
+
+    if prioritize_tool_messages:
+        for idx, msg in enumerate(messages):
+            if total <= budget:
+                break
+            if msg.get("role") == "tool":
+                _try_drop(idx)
+
+    for idx, msg in enumerate(messages):
+        if total <= budget:
+            break
+        if prioritize_tool_messages and msg.get("role") == "tool":
+            continue
+        _try_drop(idx)
+
+    # Last resort: keep dropping oldest remaining messages if still above budget.
+    for idx in range(len(messages)):
+        if total <= budget:
+            break
+        _try_drop(idx)
+
+    pruned = [msg for idx, msg in enumerate(messages) if keep[idx]]
+    return pruned, len(messages) - len(pruned)
 
 
 def _estimate_value_tokens(value: Any) -> int:

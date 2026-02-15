@@ -19,6 +19,7 @@ class ContextBuilder:
     """
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    COMPACTION_MARKER = "[context compacted]"
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -211,6 +212,39 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             "content": content
         })
         return messages
+
+    def inject_compaction_summary(
+        self,
+        messages: list[dict[str, Any]],
+        summary: str,
+        compacted_count: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Inject a compacted summary block near the front of message history.
+
+        The summary replaces older dropped messages so the model keeps coarse
+        continuity without carrying the full token cost.
+        """
+        summary_text = summary.strip() or "Older conversation content was compacted."
+        block = {
+            "role": "system",
+            "content": (
+                f"{self.COMPACTION_MARKER} {compacted_count} older messages were summarized.\n"
+                f"{summary_text}"
+            ),
+        }
+
+        cleaned = [
+            msg
+            for msg in messages
+            if not (
+                msg.get("role") == "system"
+                and isinstance(msg.get("content"), str)
+                and msg["content"].startswith(self.COMPACTION_MARKER)
+            )
+        ]
+        insert_at = 1 if cleaned and cleaned[0].get("role") == "system" else 0
+        return [*cleaned[:insert_at], block, *cleaned[insert_at:]]
     
     def add_assistant_message(
         self,
