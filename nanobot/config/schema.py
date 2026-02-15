@@ -163,6 +163,12 @@ class AgentDefaults(BaseModel):
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
+    context_guard_warn_ratio: float = 0.80
+    context_guard_block_ratio: float = 0.90
+    context_reserve_tokens: int = 2000
+    tool_result_max_chars: int = 12000
+    tool_result_max_ratio: float = 0.10
+    tool_result_truncation_notice: bool = True
 
 
 class AgentsConfig(BaseModel):

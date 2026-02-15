@@ -184,7 +184,8 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         messages: list[dict[str, Any]],
         tool_call_id: str,
         tool_name: str,
-        result: str
+        result: str,
+        truncation_notice: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add a tool result to the message list.
@@ -194,15 +195,20 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             tool_call_id: ID of the tool call.
             tool_name: Name of the tool.
             result: Tool execution result.
+            truncation_notice: Optional truncation marker to prepend.
         
         Returns:
             Updated message list.
         """
+        content = result
+        if truncation_notice:
+            content = f"{truncation_notice}\n\n{result}"
+
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
-            "content": result
+            "content": content
         })
         return messages
     

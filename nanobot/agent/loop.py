@@ -1,9 +1,11 @@
 """Agent loop: the core processing engine."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
@@ -11,6 +13,13 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context_guard import (
+    compute_context_limit,
+    compute_tool_result_limit,
+    estimate_message_tokens,
+    evaluate_context_pressure,
+)
+from nanobot.agent.tool_result_truncation import format_truncation_notice, truncate_tool_result
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -21,6 +30,10 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import ExecToolConfig
+    from nanobot.cron.service import CronService
 
 
 class AgentLoop:
@@ -45,14 +58,20 @@ class AgentLoop:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         memory_window: int = 50,
+        context_guard_warn_ratio: float = 0.80,
+        context_guard_block_ratio: float = 0.90,
+        context_reserve_tokens: int = 2000,
+        tool_result_max_chars: int = 12000,
+        tool_result_max_ratio: float = 0.10,
+        tool_result_truncation_notice: bool = True,
         brave_api_key: str | None = None,
-        exec_config: "ExecToolConfig | None" = None,
-        cron_service: "CronService | None" = None,
+        exec_config: ExecToolConfig | None = None,
+        cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
-        from nanobot.cron.service import CronService
+        from nanobot.config.schema import ExecToolConfig as RuntimeExecToolConfig
+
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
@@ -61,8 +80,14 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.context_guard_warn_ratio = context_guard_warn_ratio
+        self.context_guard_block_ratio = context_guard_block_ratio
+        self.context_reserve_tokens = context_reserve_tokens
+        self.tool_result_max_chars = tool_result_max_chars
+        self.tool_result_max_ratio = tool_result_max_ratio
+        self.tool_result_truncation_notice = tool_result_truncation_notice
         self.brave_api_key = brave_api_key
-        self.exec_config = exec_config or ExecToolConfig()
+        self.exec_config = exec_config or RuntimeExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
@@ -130,12 +155,17 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(
+        self,
+        initial_messages: list[dict],
+        session_key: str | None = None,
+    ) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
+            session_key: Session key for context pressure logging.
 
         Returns:
             Tuple of (final_content, list_of_tools_used).
@@ -147,6 +177,32 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+
+            context_limit = compute_context_limit(self.model, self.max_tokens)
+            available_limit = max(1, context_limit - self.context_reserve_tokens)
+            used_tokens = estimate_message_tokens(messages)
+            pressure = evaluate_context_pressure(
+                used=used_tokens,
+                limit=available_limit,
+                warn_ratio=self.context_guard_warn_ratio,
+                block_ratio=self.context_guard_block_ratio,
+            )
+
+            log_ctx = {
+                "session": session_key or "unknown",
+                "model": self.model,
+                "used": used_tokens,
+                "limit": available_limit,
+            }
+            if pressure == "warn":
+                logger.bind(**log_ctx).warning("Context pressure warning")
+            elif pressure == "block":
+                logger.bind(**log_ctx).warning("Context pressure block: skip provider call")
+                final_content = (
+                    "Context window is near capacity, so I paused before calling the model. "
+                    "Please send a shorter follow-up or start a new session with /new."
+                )
+                break
 
             response = await self.provider.chat(
                 messages=messages,
@@ -178,8 +234,28 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result_text = result if isinstance(result, str) else str(result)
+                    hard_limit = compute_tool_result_limit(
+                        limit=available_limit,
+                        ratio=self.tool_result_max_ratio,
+                        max_chars=self.tool_result_max_chars,
+                    )
+                    truncated_result, was_truncated = truncate_tool_result(
+                        result_text,
+                        hard_limit=hard_limit,
+                    )
+                    truncation_notice = None
+                    if was_truncated and self.tool_result_truncation_notice:
+                        truncation_notice = format_truncation_notice(
+                            original_len=len(result_text),
+                            kept_len=len(truncated_result),
+                        )
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages,
+                        tool_call.id,
+                        tool_call.name,
+                        truncated_result,
+                        truncation_notice=truncation_notice,
                     )
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
@@ -271,7 +347,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+        final_content, tools_used = await self._run_agent_loop(initial_messages, session_key=key)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -319,7 +395,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _ = await self._run_agent_loop(initial_messages, session_key=session_key)
 
         if final_content is None:
             final_content = "Background task completed."
