@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
+import json_repair
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -87,6 +89,7 @@ class AgentLoop:
         max_transient_retries: int = 1,
         max_context_recoveries: int = 2,
         enable_model_fallback: bool = False,
+        mcp_servers: dict | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig as RuntimeExecToolConfig
 
@@ -144,6 +147,9 @@ class AgentLoop:
 
         self._running = False
         self._session_tasks: set[asyncio.Task[None]] = set()
+        self._mcp_servers = mcp_servers or {}
+        self._mcp_stack: AsyncExitStack | None = None
+        self._mcp_connected = False
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -178,6 +184,16 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
     
+    async def _connect_mcp(self) -> None:
+        """Connect to configured MCP servers (one-time, lazy)."""
+        if self._mcp_connected or not self._mcp_servers:
+            return
+        self._mcp_connected = True
+        from nanobot.agent.tools.mcp import connect_mcp_servers
+        self._mcp_stack = AsyncExitStack()
+        await self._mcp_stack.__aenter__()
+        await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+
     def _set_tool_context(self, channel: str, chat_id: str) -> None:
         """Update context for all tools that need routing info."""
         if message_tool := self.tools.get("message"):
@@ -678,6 +694,7 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
+        await self._connect_mcp()
         logger.info("Agent loop started")
 
         while self._running:
@@ -703,6 +720,15 @@ class AgentLoop:
             if pending:
                 logger.warning("Stopping with {} unfinished session task(s)", len(pending))
     
+    async def close_mcp(self) -> None:
+        """Close MCP connections."""
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                pass  # MCP SDK cancel scope cleanup is noisy but harmless
+            self._mcp_stack = None
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -893,9 +919,15 @@ Respond with ONLY valid JSON, no markdown fences."""
                 model=self.model,
             )
             text = (response.content or "").strip()
+            if not text:
+                logger.warning("Memory consolidation: LLM returned empty response, skipping")
+                return
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            result = json.loads(text)
+            result = json_repair.loads(text)
+            if not isinstance(result, dict):
+                logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
+                return
 
             if entry := result.get("history_entry"):
                 memory.append_history(entry)
@@ -930,6 +962,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         Returns:
             The agent's response.
         """
+        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
