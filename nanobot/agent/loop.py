@@ -20,6 +20,7 @@ from nanobot.agent.context_guard import (
     evaluate_context_pressure,
 )
 from nanobot.agent.tool_result_truncation import format_truncation_notice, truncate_tool_result
+from nanobot.agent.followup_queue import FollowupQueue
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -29,6 +30,8 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.infra.error_types import NanobotRuntimeError, classify_error
+from nanobot.infra.retry import RetryPolicy, run_with_retry
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -64,6 +67,11 @@ class AgentLoop:
         tool_result_max_chars: int = 12000,
         tool_result_max_ratio: float = 0.10,
         tool_result_truncation_notice: bool = True,
+        retry_max_attempts: int = 3,
+        retry_base_delay_ms: int = 250,
+        retry_max_delay_ms: int = 4000,
+        retry_jitter_ratio: float = 0.15,
+        followup_debounce_ms: int = 800,
         brave_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
@@ -86,6 +94,13 @@ class AgentLoop:
         self.tool_result_max_chars = tool_result_max_chars
         self.tool_result_max_ratio = tool_result_max_ratio
         self.tool_result_truncation_notice = tool_result_truncation_notice
+        self.followup_debounce_ms = max(0, followup_debounce_ms)
+        self.retry_policy = RetryPolicy(
+            max_attempts=max(1, retry_max_attempts),
+            base_delay_ms=max(1, retry_base_delay_ms),
+            max_delay_ms=max(1, retry_max_delay_ms),
+            jitter_ratio=max(0.0, retry_jitter_ratio),
+        )
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or RuntimeExecToolConfig()
         self.cron_service = cron_service
@@ -105,8 +120,10 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
-        
+        self.followup_queue = FollowupQueue(debounce_ms=self.followup_debounce_ms)
+
         self._running = False
+        self._session_tasks: set[asyncio.Task[None]] = set()
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -154,6 +171,69 @@ class AgentLoop:
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
+
+    @staticmethod
+    def _runtime_session_key(msg: InboundMessage) -> str:
+        """Derive a stable session key for active-session serialization."""
+        if msg.channel == "system" and ":" in msg.chat_id:
+            return msg.chat_id
+        return msg.session_key
+
+    @staticmethod
+    def _provider_error_from_response(response) -> NanobotRuntimeError | None:
+        """Convert provider error-shaped response into a typed runtime error."""
+        content = (response.content or "").strip()
+        if response.finish_reason == "error" or content.lower().startswith("error calling llm:"):
+            info = classify_error(content or "Error calling LLM")
+            return NanobotRuntimeError(
+                kind=info.kind,
+                message=content or "Error calling LLM",
+                retry_after_seconds=info.retry_after_seconds,
+            )
+        return None
+
+    async def _chat_with_retry(
+        self,
+        *,
+        messages: list[dict],
+        session_key: str | None = None,
+    ):
+        """Call provider chat with unified retry behavior."""
+
+        async def _operation():
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+            if typed_error := self._provider_error_from_response(response):
+                raise typed_error
+            return response
+
+        async def _on_retry(
+            attempt: int,
+            exc: Exception,
+            info,
+            delay_seconds: float,
+        ) -> None:
+            logger.warning(
+                "Retrying provider call: session={} kind={} attempt={}/{} next_delay={:.2f}s error={}",
+                session_key or "unknown",
+                info.kind,
+                attempt + 1,
+                self.retry_policy.max_attempts,
+                delay_seconds,
+                str(exc)[:200],
+            )
+
+        return await run_with_retry(
+            _operation,
+            policy=self.retry_policy,
+            classify=classify_error,
+            on_retry=_on_retry,
+        )
 
     async def _run_agent_loop(
         self,
@@ -204,13 +284,32 @@ class AgentLoop:
                 )
                 break
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            try:
+                response = await self._chat_with_retry(
+                    messages=messages,
+                    session_key=session_key,
+                )
+            except Exception as exc:
+                info = classify_error(exc)
+                logger.warning(
+                    "Provider call failed after retries: session={} kind={} error={}",
+                    session_key or "unknown",
+                    info.kind,
+                    info.message[:300],
+                )
+                if info.kind == "context_overflow":
+                    final_content = (
+                        "Context exceeded provider limits, so I paused before continuing. "
+                        "Please send a shorter follow-up or start a new session with /new."
+                    )
+                elif info.kind in {"transient_http", "rate_limit", "timeout"}:
+                    final_content = (
+                        "The model service is temporarily unavailable after retries. "
+                        "Please try again in a moment."
+                    )
+                else:
+                    final_content = "Sorry, I encountered an unrecoverable model error."
+                break
 
             if response.has_tool_calls:
                 tool_call_dicts = [
@@ -264,6 +363,50 @@ class AgentLoop:
 
         return final_content, tools_used
 
+    def _on_session_task_done(self, task: asyncio.Task[None]) -> None:
+        """Handle completion of one session worker task."""
+        self._session_tasks.discard(task)
+        try:
+            task.result()
+        except Exception as exc:
+            logger.error("Session worker crashed: {}", exc)
+
+    def _start_session_worker(self, first_msg: InboundMessage, flow_session_key: str) -> None:
+        """Spawn one worker to process and drain a single session."""
+        task = asyncio.create_task(self._process_session_flow(first_msg, flow_session_key))
+        self._session_tasks.add(task)
+        task.add_done_callback(self._on_session_task_done)
+
+    async def _process_session_flow(self, first_msg: InboundMessage, flow_session_key: str) -> None:
+        """Process one message, then drain queued followups for the same session."""
+        self.bus.mark_task_started()
+        current_msg: InboundMessage | None = first_msg
+        try:
+            while current_msg is not None:
+                try:
+                    response = await self._process_message(current_msg)
+                    if response:
+                        await self.bus.publish_outbound(response)
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=current_msg.channel,
+                        chat_id=current_msg.chat_id,
+                        content=f"Sorry, I encountered an error: {str(e)}"
+                    ))
+
+                while True:
+                    next_msg = await self.followup_queue.pop_next(flow_session_key)
+                    if next_msg is not None:
+                        current_msg = next_msg
+                        break
+                    if await self.followup_queue.deactivate_if_idle(flow_session_key):
+                        current_msg = None
+                        break
+        finally:
+            await self.followup_queue.deactivate_if_idle(flow_session_key)
+            self.bus.mark_task_done()
+
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
@@ -275,19 +418,22 @@ class AgentLoop:
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
-                try:
-                    response = await self._process_message(msg)
-                    if response:
-                        await self.bus.publish_outbound(response)
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
             except asyncio.TimeoutError:
                 continue
+
+            flow_session_key = self._runtime_session_key(msg)
+            queued = await self.followup_queue.enqueue_if_active(flow_session_key, msg)
+            if queued:
+                logger.debug("Queued followup for active session {}", flow_session_key)
+                continue
+
+            self._start_session_worker(msg, flow_session_key)
+
+        await self.bus.wait_for_active_tasks(timeout_ms=5_000)
+        if self._session_tasks:
+            _, pending = await asyncio.wait(self._session_tasks, timeout=5.0)
+            if pending:
+                logger.warning("Stopping with {} unfinished session task(s)", len(pending))
     
     def stop(self) -> None:
         """Stop the agent loop."""
