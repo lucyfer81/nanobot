@@ -379,6 +379,10 @@ class AgentLoop:
         if outcome.is_terminal():
             return RecoveryAction.stop_no_action(), context_retries, transient_retries
 
+        # NEEDS_FOLLOWUP means more work is pending - continue to next turn
+        if outcome.kind == RunOutcomeKind.NEEDS_FOLLOWUP:
+            return RecoveryAction.retry_same(), context_retries, transient_retries
+
         if outcome.kind == RunOutcomeKind.RETRYABLE_ERROR:
             error_kind = outcome.diagnostics.get("error_kind")
             if error_kind == "context_overflow":
@@ -604,9 +608,24 @@ class AgentLoop:
             )
 
         # Extract final content from outcome
-        if final_outcome.kind == RunOutcomeKind.SUCCESS:
+        # Check if payload has actual content (not None or empty/whitespace)
+        if final_outcome.payload and isinstance(final_outcome.payload, str) and final_outcome.payload.strip():
             return final_outcome.payload, tools_used
+        elif final_outcome.kind == RunOutcomeKind.SUCCESS:
+            # SUCCESS outcome but no/empty content - provide helpful message
+            return (
+                "我已完成执行，但没有生成响应内容。这通常发生在模型只调用了工具但没有生成文本回复。"
+                "请尝试重新表述您的问题，或者提供更多上下文信息。"
+            ), tools_used
+        elif final_outcome.kind == RunOutcomeKind.NO_REPLY:
+            # Max turns reached without terminal outcome
+            return (
+                "我已执行多轮操作但未能在限制内生成完整的响应。这可能是因为任务较复杂，"
+                "或者需要更多轮次的对话。请尝试：1) 提供更具体的指令；2) 将复杂任务拆分为多个简单问题；"
+                "3) 使用 /new 命令开始新的会话。"
+            ), tools_used
         elif final_outcome.payload:
+            # Payload exists but not a string or edge case
             return final_outcome.payload, tools_used
         else:
             return None, tools_used
