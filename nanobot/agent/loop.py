@@ -32,6 +32,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory_flush import MemoryFlushTrigger
 from nanobot.agent.subagent import SubagentManager
 from nanobot.infra.error_types import NanobotRuntimeError, classify_error
 from nanobot.infra.retry import RetryPolicy, run_with_retry
@@ -83,6 +84,9 @@ class AgentLoop:
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        memory_flush_enabled: bool = True,
+        memory_flush_reserve_floor: int = 20_000,
+        memory_flush_soft_threshold: int = 4_000,
         # PR-04: Outcome-driven execution limits
         max_turns_per_request: int = 12,
         max_recovery_attempts: int = 4,
@@ -123,6 +127,13 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
+        self.memory_flush = MemoryFlushTrigger(
+            workspace=workspace,
+            context_window_tokens=self.context_window_tokens,
+            enabled=memory_flush_enabled,
+            reserve_floor=memory_flush_reserve_floor,
+            soft_threshold=memory_flush_soft_threshold,
+        )
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -646,6 +657,64 @@ class AgentLoop:
         else:
             return None, tools_used
 
+    async def _maybe_flush_memory(
+        self,
+        *,
+        session: Session,
+        messages_for_estimate: list[dict],
+        pending_user_message: str | None = None,
+    ) -> bool:
+        """
+        Trigger one silent memory flush when nearing compaction threshold.
+
+        Flush is edge-triggered: once fired in a "high pressure zone", it will not
+        fire again until token usage falls below the threshold and re-arms.
+        """
+        if not self.memory_flush.enabled:
+            return False
+
+        current_tokens = estimate_message_tokens(messages_for_estimate)
+        should_flush = self.memory_flush.should_flush(current_tokens)
+
+        if not isinstance(session.metadata, dict):
+            session.metadata = {}
+
+        armed = session.metadata.get("memory_flush_armed", True)
+        if not isinstance(armed, bool):
+            armed = True
+
+        if not should_flush:
+            if not armed:
+                session.metadata["memory_flush_armed"] = True
+            return False
+
+        if not armed:
+            return False
+
+        saved = await self.memory_flush.trigger_flush(
+            provider=self.provider,
+            model=self.model,
+            session=session,
+            memory_store=MemoryStore(self.workspace),
+            pending_user_message=pending_user_message,
+        )
+        session.metadata["memory_flush_armed"] = False
+
+        if saved:
+            logger.info(
+                "Memory flush: saved durable notes before compaction pressure "
+                "(session={}, tokens={})",
+                session.key,
+                current_tokens,
+            )
+        else:
+            logger.debug(
+                "Memory flush: nothing saved (session={}, tokens={})",
+                session.key,
+                current_tokens,
+            )
+        return saved
+
 
     def _on_session_task_done(self, task: asyncio.Task[None]) -> None:
         """Handle completion of one session worker task."""
@@ -791,6 +860,23 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        flushed = await self._maybe_flush_memory(
+            session=session,
+            messages_for_estimate=initial_messages,
+            pending_user_message=msg.content,
+        )
+        if flushed:
+            # Rebuild so the current turn can see freshly persisted memory context.
+            initial_messages = self.context.build_messages(
+                history=session.get_history(
+                    max_messages=self.memory_window,
+                    max_tokens=history_budget_tokens,
+                ),
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
         final_content, tools_used = await self._run_agent_loop(initial_messages, session_key=key)
 
         if final_content is None:
@@ -843,6 +929,21 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
+        flushed = await self._maybe_flush_memory(
+            session=session,
+            messages_for_estimate=initial_messages,
+            pending_user_message=msg.content,
+        )
+        if flushed:
+            initial_messages = self.context.build_messages(
+                history=session.get_history(
+                    max_messages=self.memory_window,
+                    max_tokens=history_budget_tokens,
+                ),
+                current_message=msg.content,
+                channel=origin_channel,
+                chat_id=origin_chat_id,
+            )
         final_content, _ = await self._run_agent_loop(initial_messages, session_key=session_key)
 
         if final_content is None:

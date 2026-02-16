@@ -10,8 +10,8 @@
 
 ## 技术栈
 
-- **语义检索**: QMD CLI (本地，基于Bun + SQLite + node-llama-cpp)
-- **优先级排序**: Memory Flush → QMD → Bootstrap预算 → 自适应Compaction
+- **语义检索**: Built-in Lite检索 (SQLite FTS5 + grep fallback)
+- **优先级排序**: Memory Flush → Lite检索 → Bootstrap预算 → 自适应Compaction
 
 ---
 
@@ -255,261 +255,148 @@ You: "我刚才说喜欢什么语言？"
 
 ---
 
-## PR-02: QMD CLI集成 - 语义检索
+## PR-02: Lite检索与结构化记忆 - 三档开关
 
 ### 目标
 
-引入QMD CLI进行本地语义检索，基于稳定的memory基础（PR-01）实现精准召回。
+在不引入QMD/Bun/embedding依赖的前提下，显著提升记忆召回质量，并把“触发式检索漏掉历史信息”的风险降到可接受范围。
 
 ### 依赖
 
-**必须先完成PR-01**，确保MEMORY.md有稳定的内容来源。
+**必须先完成PR-01**，确保记忆写入链路稳定（flush + consolidation）。
 
 ### 问题
 
 ```
-# 当前：grep全文搜索
-User: "我之前怎么配置API的？"
-Agent: grep HISTORY.md "API" → 返回100行，找不到关键配置 ❌
+# 当前：两种极端都不好
+1) 全量grep：噪声高，常返回大量无关行
+2) 纯触发检索：如果误判为“非回忆问题”，会漏检
 
-# 期望：语义检索
-User: "我之前怎么配置API的？"
-Agent: qmd query "API配置" → 精准返回相关片段 ✅
+User: "按我之前约束（Cloudflare免费计划 + sqlite）再给方案"
+Agent: 未触发检索，直接回答 → 可能与历史决策冲突 ❌
 ```
 
 ### 解决方案
 
-集成QMD CLI，提供BM25、Vector、Hybrid三种检索模式。
+采用 **PR-02 Lite**，由三部分组成：
+
+1. **统一记忆格式**（写入侧提质）
+2. **内置轻量检索**（SQLite FTS5 + grep fallback）
+3. **三档检索路由**（0档/1档/2档 + 失败回退）
 
 ### 新增文件
 
 ```
-nanobot/agent/qmd_client.py          # QMD CLI封装
-tests/test_qmd_client.py             # 测试
+nanobot/agent/memory_retrieval.py      # Lite检索器（FTS + 排序 + 压缩）
+tests/test_memory_retrieval.py         # 检索与路由测试
 ```
 
 ### 修改文件
 
 ```
-nanobot/agent/context.py             # 集成QMD检索
-nanobot/agent/__init__.py           # 导出QMDClient
+nanobot/agent/context.py               # 三档检索路由 + 结果注入
+nanobot/agent/memory.py                # 结构化写入 + 索引更新接口
+nanobot/agent/memory_flush.py          # flush输出结构化字段
+nanobot/agent/loop.py                  # consolidate输出结构化字段
+nanobot/config/schema.py               # Lite检索配置
 ```
 
 ### 核心功能
 
-#### 1. QMDClient
+#### 1. 统一记忆文件格式（最小规范）
+
+每条记忆使用固定头部字段，便于低成本检索：
+
+```markdown
+### 2026-02-16 14:20
+type: decision
+tags: cloudflare, sqlite, deploy
+tl;dr: 保持免费方案，后端继续使用sqlite并避免额外托管组件
+
+details:
+- 决策原因：部署成本最低，维护简单
+- 约束条件：Cloudflare Free Plan，轻量部署
+```
+
+字段约束：
+- `type`: `decision | note | bug | idea | config`
+- `tl;dr`: 一句话结论（建议10-30字）
+- `tags`: 逗号分隔（可选但强烈建议）
+
+#### 2. Lite检索器（无外部依赖）
 
 ```python
-import subprocess
-import json
-from pathlib import Path
-from typing import List, Dict, Optional
-import logging
+# nanobot/agent/memory_retrieval.py
 
-log = logging.getLogger(__name__)
-
-class QMDClient:
-    """QMD CLI客户端封装"""
+class MemoryRetriever:
+    """Built-in retriever: SQLite FTS5 first, grep fallback."""
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self._ensure_initialized()
+        self.db = workspace / "memory" / "index.db"
+        self._ensure_index()
 
-    def _ensure_initialized(self):
-        """检查并初始化qmd collection"""
-        # 1. 检查qmd是否安装
-        try:
-            subprocess.run(
-                ["qmd", "--version"],
-                capture_output=True,
-                check=True,
-                timeout=5
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            raise RuntimeError(
-                "QMD not found. Install with: bun install -g github:tobi/qmd\n"
-                f"Error: {e}"
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("QMD command timed out")
-
-        # 2. 检查collection
-        collections = self._list_collections()
-
-        if not any(c.get("name") == "memory" for c in collections):
-            log.info("Initializing QMD collection...")
-            self._create_collection()
-            self._generate_embeddings()
-        else:
-            log.info(f"QMD collection 'memory' already exists")
-
-    def _list_collections(self) -> List[Dict]:
-        """列出所有collections"""
-        result = subprocess.run(
-            ["qmd", "collection", "list", "--json"],
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            return []
-
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError:
-            log.error(f"Failed to parse QMD output: {result.stdout}")
-            return []
-
-    def _create_collection(self):
-        """创建memory collection"""
-        subprocess.run(
-            ["qmd", "collection", "add",
-             str(self.workspace),
-             "--name", "memory",
-             "--mask", "**/*.md"],
-            check=True
-        )
-        log.info(f"Created QMD collection: {self.workspace}")
-
-    def _generate_embeddings(self):
-        """生成embeddings（首次可能需要几分钟）"""
-        log.info("Generating embeddings (this may take a few minutes on first run)...")
-
-        subprocess.run(
-            ["qmd", "embed"],
-            check=True
-        )
-
-        log.info("Embeddings generated successfully")
-
-    def search(
-        self,
-        query: str,
-        mode: str = "search",
-        max_results: int = 10,
-        min_score: float = 0.3
-    ) -> List[Dict]:
+    def search_light(self, query: str, top_k: int = 3) -> list[dict]:
         """
-        搜索记忆
-
-        Args:
-            query: 搜索查询
-            mode: search (BM25) | vsearch (Vector) | query (Hybrid+Rerank)
-            max_results: 最大返回结果数
-            min_score: 最低相似度阈值
-
-        Returns:
-            List[Dict]: 搜索结果列表
+        1档轻检索：仅搜 tl;dr + tags + title
+        成本低，适合“可能是回忆问题”但不要求精确引用
         """
-        if mode not in ("search", "vsearch", "query"):
-            raise ValueError(f"Invalid mode: {mode}")
+        ...
 
-        try:
-            result = subprocess.run(
-                [
-                    "qmd", mode, query,
-                    "--json",
-                    "-n", str(max_results),
-                    "--min-score", str(min_score)
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30  # 30s timeout (query mode with rerank可能很慢)
-            )
+    def search_heavy(self, query: str, top_k: int = 8) -> list[dict]:
+        """
+        2档重检索：full text chunk + BM25 + 时间衰减 + 去重压缩
+        用于精确回忆、参数/日期/命令、一致性约束
+        """
+        ...
 
-            if result.returncode != 0:
-                log.error(f"QMD search failed: {result.stderr}")
-                return []
-
-            data = json.loads(result.stdout)
-            return data.get("results", [])
-
-        except subprocess.TimeoutExpired:
-            log.error(f"QMD search timed out (mode={mode})")
-            return []
-        except json.JSONDecodeError:
-            log.error(f"Failed to parse QMD JSON output")
-            return []
-
-    def get_status(self) -> Dict:
-        """获取QMD状态"""
-        result = subprocess.run(
-            ["qmd", "status", "--json"],
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            return {}
-
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return {}
+    def probe(self, query: str) -> float:
+        """
+        0档探测：始终做一次超轻探测（top-1 score）
+        仅用于判断“是否可能需要升级检索”，默认不注入上下文
+        """
+        ...
 ```
 
-#### 2. ContextBuilder集成
+排序建议：
+- `final_score = bm25_score * 0.75 + recency_boost * 0.25`
+- `recency_boost` 基于条目时间衰减（最近条目略优先）
+
+#### 3. 三档检索路由（0/1/2）
 
 ```python
 # nanobot/agent/context.py
 
-class ContextBuilder:
-    def __init__(self, workspace: Path):
-        self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+class RetrievalTier(IntEnum):
+    OFF = 0    # 不注入，仅做probe
+    LIGHT = 1  # 轻检索（tl;dr/tags/title）
+    HEAVY = 2  # 重检索（chunk + 排序 + 压缩 + 引用）
 
-        # 初始化QMD（可选，如果配置启用）
-        try:
-            from .qmd_client import QMDClient
-            self.qmd = QMDClient(workspace)
-        except Exception as e:
-            log.warning(f"QMD not available: {e}")
-            self.qmd = None
 
-    def build_system_prompt(self, skill_names=None):
-        parts = []
+def choose_retrieval_tier(user_message: str, recent_turns: list[str]) -> RetrievalTier:
+    explicit_signals = [
+        "之前", "上次", "记得", "回顾", "复盘", "我们聊过",
+        "你说过", "我说过", "按之前", "照旧", "沿用", "查一下记录"
+    ]
+    implicit_signals = [
+        "具体日期", "端口", "参数", "命令", "决策原因", "不要冲突"
+    ]
+    # 显式信号命中 -> HEAVY
+    # 仅隐式信号命中 -> LIGHT
+    # 都未命中 -> OFF（但执行probe）
+    ...
 
-        # ...existing code (identity, bootstrap, skills)...
 
-        # 新增：检索相关记忆
-        if self.qmd:
-            results = self._search_relevant_memory()
-            if results:
-                memory_context = self._format_qmd_results(results)
-                parts.append(f"## Relevant Memory\n\n{memory_context}")
-
-        return "\n\n---\n\n".join(parts)
-
-    def _search_relevant_memory(self) -> List[Dict]:
-        """搜索相关记忆"""
-        # 使用query模式（质量最好）
-        results = self.qmd.search(
-            "recent decisions and user preferences",
-            mode="query",  # Hybrid + Rerank
-            max_results=5,
-            min_score=0.4
-        )
-        return results
-
-    def _format_qmd_results(self, results: List[Dict]) -> str:
-        """格式化QMD搜索结果"""
-        if not results:
-            return "No relevant memories found."
-
-        lines = []
-        for r in results:
-            docid = r.get("docid", "")
-            file = r.get("file", "")
-            score = r.get("score", 0)
-            snippet = r.get("snippet", "")[:500]
-
-            lines.append(
-                f"- **[{docid}]** ({file}) [{score:.2f}]\n"
-                f"  {snippet}..."
-            )
-
-        return "\n\n".join(lines)
+def maybe_upgrade_after_draft(draft: str, current_tier: RetrievalTier) -> RetrievalTier:
+    uncertain_markers = ["可能", "大概", "我猜", "不确定", "记不清"]
+    # 如果回答显著不确定，则升级 0->1 或 1->2 重检索再答
+    ...
 ```
+
+关键点：
+- **0档不是“什么都不做”**：执行一次超轻 `probe`，默认不注入上下文。
+- **失败回退**：当回答表现出不确定性，自动升级检索档位并重答。
+- **重检索必须引用来源**：返回片段附 `file + date + snippet`，降低“记错”风险。
 
 ### 配置参数
 
@@ -517,135 +404,144 @@ class ContextBuilder:
 # config.yaml
 memory_search:
   enabled: true
-  backend: "qmd"              # qmd | builtin
-  mode: "query"                # search | vsearch | query
-  max_results: 5
-  min_score: 0.4
-  timeout_seconds: 30
+  backend: "builtin_fts"           # builtin_fts | grep_only
+
+  tiers:
+    enable_probe_on_off: true      # 0档也做超轻探测
+    light_top_k: 3                 # 1档
+    heavy_top_k: 8                 # 2档
+    heavy_max_snippet_chars: 360
+    inject_budget_chars: 1800      # 注入系统提示词的总预算
+
+  routing:
+    explicit_anchors:
+      - "之前"
+      - "上次"
+      - "记得"
+      - "你说过"
+      - "我说过"
+      - "按之前"
+      - "查一下记录"
+    uncertain_markers:
+      - "可能"
+      - "大概"
+      - "我猜"
+      - "不确定"
+      - "记不清"
+
+  timeouts:
+    probe_ms: 80
+    light_ms: 180
+    heavy_ms: 450
 ```
 
 ### 验收标准
 
-- [ ] QMD CLI正确安装并可用
-- [ ] Collection自动创建并生成embeddings
-- [ ] 三种搜索模式（search/vsearch/query）正常工作
-- [ ] 搜索结果正确格式化并注入system prompt
-- [ ] 用户问题能精准召回相关记忆
-- [ ] 超时时有降级处理
+- [ ] 不依赖QMD/Bun/node-llama-cpp，开箱可用
+- [ ] 记忆条目满足最小结构：`type/tags/tl;dr/details`
+- [ ] 三档路由工作正常（0档/1档/2档）
+- [ ] 0档默认不注入上下文，但会执行probe
+- [ ] 不确定回答可触发自动升级检索并重答
+- [ ] 重检索结果包含来源信息（文件/时间/片段）
+- [ ] FTS不可用时自动降级到grep，不中断主流程
 
 ### 测试计划
 
 ```python
-# tests/test_qmd_client.py
+# tests/test_memory_retrieval.py
 
-def test_qmd_initialization():
-    """测试QMD初始化"""
-    client = QMDClient(workspace)
+def test_structured_memory_entry_format():
+    """写入的记忆条目包含type/tags/tl;dr字段"""
+    entry = build_memory_entry(
+        type="decision",
+        tags=["cloudflare", "sqlite"],
+        tldr="继续使用sqlite，保持免费部署方案",
+        details="..."
+    )
+    assert "type:" in entry
+    assert "tags:" in entry
+    assert "tl;dr:" in entry
 
-    # 应该创建collection
-    collections = client._list_collections()
-    assert any(c["name"] == "memory" for c in collections)
 
-def test_search_modes():
-    """测试三种搜索模式"""
-    client = QMDClient(workspace)
+def test_tier_routing_explicit_signal():
+    """显式回忆词命中应走2档"""
+    tier = choose_retrieval_tier("按之前约定的配置继续", [])
+    assert tier == RetrievalTier.HEAVY
 
-    # 1. BM25 search
-    results_bm25 = client.search("API", mode="search")
-    assert isinstance(results_bm25, list)
 
-    # 2. Vector search
-    results_vec = client.search("如何配置", mode="vsearch")
-    assert isinstance(results_vec, list)
+def test_tier_routing_implicit_signal():
+    """需要参数/日期/命令但无显式词时走1档"""
+    tier = choose_retrieval_tier("给我上次那个端口和命令", [])
+    assert tier in (RetrievalTier.LIGHT, RetrievalTier.HEAVY)
 
-    # 3. Hybrid search
-    results_hybrid = client.search("配置", mode="query")
-    assert isinstance(results_hybrid, list)
 
-def test_search_result_format():
-    """测试搜索结果格式"""
-    client = QMDClient(workspace)
-    results = client.search("Python", mode="search", max_results=3)
+def test_off_tier_still_probes():
+    """0档不注入，但会执行probe"""
+    result = router.run(query="解释一下这个概念", tier=RetrievalTier.OFF)
+    assert result.probe_score >= 0
+    assert result.injected_context == ""
 
-    for r in results:
-        assert "docid" in r
-        assert "file" in r
-        assert "score" in r
-        assert "snippet" in r
-        assert 0 <= r["score"] <= 1.0
 
-async def test_context_builder_integration():
-    """测试与ContextBuilder的集成"""
-    builder = ContextBuilder(workspace)
+def test_uncertain_answer_triggers_upgrade():
+    """回答不确定时自动升级档位"""
+    upgraded = maybe_upgrade_after_draft("我不确定，可能是...", RetrievalTier.LIGHT)
+    assert upgraded == RetrievalTier.HEAVY
 
-    # 应该初始化QMD
-    assert builder.qmd is not None
 
-    # 搜索结果应该注入system prompt
-    system_prompt = builder.build_system_prompt()
-    assert "Relevant Memory" in system_prompt or "No relevant memories" in system_prompt
+def test_heavy_search_returns_citations():
+    """2档结果必须可追溯"""
+    rows = retriever.search_heavy("为什么不用embedding", top_k=5)
+    assert rows
+    assert all("file" in r and "snippet" in r for r in rows)
 
-def test_qmd_fallback():
-    """测试QMD不可用时的fallback"""
-    # Mock QMD初始化失败
-    with unittest.mock.patch('subprocess.run') as mock_run:
-        mock_run.side_effect = FileNotFoundError("qmd not found")
 
-        with pytest.raises(RuntimeError):
-            QMDClient(workspace)
-
-def test_search_timeout():
-    """测试搜索超时处理"""
-    client = QMDClient(workspace)
-
-    # Mock超时
-    with unittest.mock.patch('subprocess.run') as mock_run:
-        mock_run.side_effect = subprocess.TimeoutExpired("qmd", 30)
-
-        results = client.search("test", mode="query")
-        assert results == []  # 应该返回空列表，不抛异常
+def test_grep_fallback_when_fts_unavailable():
+    """FTS不可用时自动回退grep"""
+    retriever = MemoryRetriever(workspace, force_disable_fts=True)
+    rows = retriever.search_light("sqlite")
+    assert isinstance(rows, list)
 ```
 
 ### 手动验证步骤
 
 ```bash
-# 1. 确保MEMORY.md有内容（PR-01的成果）
-ls -lh ~/workspace/memory/MEMORY.md
+# 1. 确认记忆文件存在并带结构化字段
+grep -n "tl;dr:" memory/MEMORY.md | head
+grep -n "type:" memory/MEMORY.md | head
 
-# 2. 测试BM25搜索（快速）
-qmd search "Python" --json -n 5
-# 应该返回包含"Python"的结果
-
-# 3. 测试向量搜索（语义）
-qmd vsearch "编程语言偏好" --json -n 5
-# 应该返回关于"喜欢Python"的结果
-
-# 4. 测试混合搜索（最佳质量）
-qmd query "如何配置" --json -n 5
-# 应该返回最相关的结果
-
-# 5. 集成测试
+# 2. 0档问题（默认不注入）
 python -m nanobot.cli
-You: "我之前说喜欢用什么语言？"
-# 应该回答：Python（基于QMD检索）
+You: "解释一下为什么要做上下文压缩"
+# 预期：回答正常，日志显示probe执行，但未注入Memory片段
+
+# 3. 1档问题（轻检索）
+You: "我以前有没有写过关于部署约束的笔记？"
+# 预期：返回少量tl;dr命中结果
+
+# 4. 2档问题（重检索）
+You: "我上次为什么决定不用embedding？"
+# 预期：回答带来源片段（文件/日期/摘要），且与历史一致
+
+# 5. 失败回退
+You: "那个配置细节你记得吗？给精确参数"
+# 预期：若首答不确定，系统自动升级检索并重答
 ```
 
 ### 风险与缓解
 
 | 风险 | 缓解措施 |
 |------|----------|
-| QMD未安装 | 提供清晰的安装指引，失败时禁用QMD |
-| 首次embeddings很慢 | 显示进度，设置合理超时 |
-| Query模式太慢（10s+） | 提供mode配置选项，默认用search |
-| 子进程失败 | 捕获异常，记录log，返回空列表 |
-| JSON解析失败 | 捕获异常，记录log，返回空列表 |
+| 写入格式漂移导致检索质量下降 | 在flush/consolidate阶段强制模板化写入 |
+| 0档漏检回忆类问题 | 0档保留probe + 不确定回答自动升级 |
+| 重检索注入过多污染上下文 | 设定严格注入预算（字符/条数上限） |
+| FTS环境差异导致不可用 | 自动降级grep并打日志，不阻塞会话 |
 
 ### 成功指标
 
-- QMD检索成功率 > 95%
-- 平均检索时间 < 5s (search), < 15s (query)
-- 语义召回准确率 > 80% (人工评估)
-- 用户满意度：记忆"找得到"
+- Lite检索可用率 > 99%（含fallback）
+- 1档平均检索时间 < 200ms，2档 < 500ms
+- 回忆类问题首次命中率 > 80%，升级后二次命中率 > 92%
+- 用户反馈：历史决策/配置“更一致、更可追溯”
 
 ---
 
@@ -1349,7 +1245,7 @@ python -m nanobot.cli
 ```
 PR-01 (Memory Flush)
     ↓
-PR-02 (QMD CLI) ← 依赖PR-01的稳定memory
+PR-02 (Lite检索 + 结构化记忆) ← 依赖PR-01的稳定memory
     ↓
 PR-03 (Bootstrap预算)
     ↓
@@ -1371,20 +1267,20 @@ PR-04 (自适应Compaction)
 | PR | 工作量 | 测试 | 总计 |
 |----|--------|------|------|
 | PR-01 | 2天 | 1天 | 3天 |
-| PR-02 | 1天 | 1天 | 2天 |
+| PR-02 | 1天 | 0.5天 | 1.5天 |
 | PR-03 | 1天 | 0.5天 | 1.5天 |
 | PR-04 | 2天 | 1天 | 3天 |
-| **总计** | **6天** | **3.5天** | **9.5天** |
+| **总计** | **6天** | **3天** | **9天** |
 
 ### 下一步行动
 
 1. **立即开始PR-01** - Memory Flush（最高价值）
 2. 完成后验证memory被正确保存
-3. 再启动PR-02 - QMD集成
+3. 再启动PR-02 - Lite检索与结构化记忆
 4. 根据效果决定PR-03和PR-04的优先级
 
 ---
 
-**文档版本**: v1.0
-**最后更新**: 2025-02-16
+**文档版本**: v1.1
+**最后更新**: 2026-02-16
 **维护者**: nanobot team

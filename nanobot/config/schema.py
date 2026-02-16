@@ -155,6 +155,13 @@ class ChannelsConfig(BaseModel):
     qq: QQConfig = Field(default_factory=QQConfig)
 
 
+class MemoryFlushConfig(BaseModel):
+    """Memory flush trigger configuration."""
+    enabled: bool = True
+    reserve_floor: int = 20_000
+    soft_threshold: int = 4_000
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
@@ -171,6 +178,7 @@ class AgentDefaults(BaseModel):
     tool_result_max_chars: int = 12000
     tool_result_max_ratio: float = 0.10
     tool_result_truncation_notice: bool = True
+    memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
     # PR-04: Outcome-driven execution limits
     max_turns_per_request: int = 12
     max_recovery_attempts: int = 4

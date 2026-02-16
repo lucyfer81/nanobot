@@ -9,6 +9,16 @@ from nanobot.channels.email import EmailChannel
 from nanobot.config.schema import EmailConfig
 
 
+@pytest.fixture(autouse=True)
+def _run_email_channel_to_thread_inline(monkeypatch):
+    """Avoid environment-specific threadpool teardown hangs in tests."""
+
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("nanobot.channels.email.asyncio.to_thread", _inline_to_thread)
+
+
 def _make_config() -> EmailConfig:
     return EmailConfig(
         enabled=True,
