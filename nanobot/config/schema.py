@@ -160,9 +160,23 @@ class AgentDefaults(BaseModel):
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
+    context_window_tokens: int = 96000
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
+    context_guard_warn_ratio: float = 0.80
+    context_guard_block_ratio: float = 0.90
+    context_reserve_tokens: int = 2000
+    history_budget_ratio: float = 0.60
+    tool_result_max_chars: int = 12000
+    tool_result_max_ratio: float = 0.10
+    tool_result_truncation_notice: bool = True
+    # PR-04: Outcome-driven execution limits
+    max_turns_per_request: int = 12
+    max_recovery_attempts: int = 4
+    max_transient_retries: int = 1
+    max_context_recoveries: int = 2
+    enable_model_fallback: bool = False
 
 
 class AgentsConfig(BaseModel):
@@ -216,11 +230,20 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
+class MCPServerConfig(BaseModel):
+    """MCP server connection configuration (stdio or HTTP)."""
+    command: str = ""  # Stdio: command to run (e.g. "npx")
+    args: list[str] = Field(default_factory=list)  # Stdio: command arguments
+    env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
+    url: str = ""  # HTTP: streamable HTTP endpoint URL
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
 class Config(BaseSettings):

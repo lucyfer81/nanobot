@@ -339,13 +339,28 @@ def gateway(
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        context_guard_warn_ratio=config.agents.defaults.context_guard_warn_ratio,
+        context_guard_block_ratio=config.agents.defaults.context_guard_block_ratio,
+        context_reserve_tokens=config.agents.defaults.context_reserve_tokens,
+        history_budget_ratio=config.agents.defaults.history_budget_ratio,
+        tool_result_max_chars=config.agents.defaults.tool_result_max_chars,
+        tool_result_max_ratio=config.agents.defaults.tool_result_max_ratio,
+        tool_result_truncation_notice=config.agents.defaults.tool_result_truncation_notice,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        # PR-04: Outcome-driven execution limits
+        max_turns_per_request=config.agents.defaults.max_turns_per_request,
+        max_recovery_attempts=config.agents.defaults.max_recovery_attempts,
+        max_transient_retries=config.agents.defaults.max_transient_retries,
+        max_context_recoveries=config.agents.defaults.max_context_recoveries,
+        enable_model_fallback=config.agents.defaults.enable_model_fallback,
+        mcp_servers=config.tools.mcp_servers,
     )
     
     # Set cron callback (needs agent)
@@ -403,6 +418,8 @@ def gateway(
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        finally:
+            await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
@@ -448,11 +465,26 @@ def agent(
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        context_guard_warn_ratio=config.agents.defaults.context_guard_warn_ratio,
+        context_guard_block_ratio=config.agents.defaults.context_guard_block_ratio,
+        context_reserve_tokens=config.agents.defaults.context_reserve_tokens,
+        history_budget_ratio=config.agents.defaults.history_budget_ratio,
+        tool_result_max_chars=config.agents.defaults.tool_result_max_chars,
+        tool_result_max_ratio=config.agents.defaults.tool_result_max_ratio,
+        tool_result_truncation_notice=config.agents.defaults.tool_result_truncation_notice,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        # PR-04: Outcome-driven execution limits
+        max_turns_per_request=config.agents.defaults.max_turns_per_request,
+        max_recovery_attempts=config.agents.defaults.max_recovery_attempts,
+        max_transient_retries=config.agents.defaults.max_transient_retries,
+        max_context_recoveries=config.agents.defaults.max_context_recoveries,
+        enable_model_fallback=config.agents.defaults.enable_model_fallback,
+        mcp_servers=config.tools.mcp_servers,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -469,6 +501,7 @@ def agent(
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id)
             _print_agent_response(response, render_markdown=markdown)
+            await agent_loop.close_mcp()
         
         asyncio.run(run_once())
     else:
@@ -484,30 +517,33 @@ def agent(
         signal.signal(signal.SIGINT, _exit_on_sigint)
         
         async def run_interactive():
-            while True:
-                try:
-                    _flush_pending_tty_input()
-                    user_input = await _read_interactive_input_async()
-                    command = user_input.strip()
-                    if not command:
-                        continue
+            try:
+                while True:
+                    try:
+                        _flush_pending_tty_input()
+                        user_input = await _read_interactive_input_async()
+                        command = user_input.strip()
+                        if not command:
+                            continue
 
-                    if _is_exit_command(command):
+                        if _is_exit_command(command):
+                            _restore_terminal()
+                            console.print("\nGoodbye!")
+                            break
+                        
+                        with _thinking_ctx():
+                            response = await agent_loop.process_direct(user_input, session_id)
+                        _print_agent_response(response, render_markdown=markdown)
+                    except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")
                         break
-                    
-                    with _thinking_ctx():
-                        response = await agent_loop.process_direct(user_input, session_id)
-                    _print_agent_response(response, render_markdown=markdown)
-                except KeyboardInterrupt:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
-                except EOFError:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
+                    except EOFError:
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+            finally:
+                await agent_loop.close_mcp()
         
         asyncio.run(run_interactive())
 

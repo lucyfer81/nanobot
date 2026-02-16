@@ -1,6 +1,7 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import json
+import json_repair
 import os
 from typing import Any
 
@@ -9,6 +10,7 @@ from litellm import acompletion
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
+from nanobot.infra.error_types import NanobotRuntimeError, classify_error
 
 
 class LiteLLMProvider(LLMProvider):
@@ -122,6 +124,10 @@ class LiteLLMProvider(LLMProvider):
         """
         model = self._resolve_model(model or self.default_model)
         
+        # Clamp max_tokens to at least 1 — negative or zero values cause
+        # LiteLLM to reject the request with "max_tokens must be at least 1".
+        max_tokens = max(1, max_tokens)
+        
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -152,11 +158,13 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
+            # Classify error and raise structured error type
+            info = classify_error(str(e))
+            raise NanobotRuntimeError(
+                kind=info.kind,
+                message=str(e),
+                retry_after_seconds=info.retry_after_seconds,
+            ) from e
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
@@ -169,10 +177,7 @@ class LiteLLMProvider(LLMProvider):
                 # Parse arguments from JSON string if needed
                 args = tc.function.arguments
                 if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {"raw": args}
+                    args = json_repair.loads(args)
                 
                 tool_calls.append(ToolCallRequest(
                     id=tc.id,
