@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
+from loguru import logger
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
@@ -345,6 +346,7 @@ def gateway(
         memory_flush_enabled=config.agents.defaults.memory_flush.enabled,
         memory_flush_reserve_floor=config.agents.defaults.memory_flush.reserve_floor,
         memory_flush_soft_threshold=config.agents.defaults.memory_flush.soft_threshold,
+        memory_search_config=config.agents.defaults.memory_search,
         context_guard_warn_ratio=config.agents.defaults.context_guard_warn_ratio,
         context_guard_block_ratio=config.agents.defaults.context_guard_block_ratio,
         context_reserve_tokens=config.agents.defaults.context_reserve_tokens,
@@ -474,6 +476,7 @@ def agent(
         memory_flush_enabled=config.agents.defaults.memory_flush.enabled,
         memory_flush_reserve_floor=config.agents.defaults.memory_flush.reserve_floor,
         memory_flush_soft_threshold=config.agents.defaults.memory_flush.soft_threshold,
+        memory_search_config=config.agents.defaults.memory_search,
         context_guard_warn_ratio=config.agents.defaults.context_guard_warn_ratio,
         context_guard_block_ratio=config.agents.defaults.context_guard_block_ratio,
         context_reserve_tokens=config.agents.defaults.context_reserve_tokens,
@@ -548,6 +551,13 @@ def agent(
                         _restore_terminal()
                         console.print("\nGoodbye!")
                         break
+                    except Exception as exc:
+                        logger.exception("Interactive turn failed: {}", exc)
+                        _restore_terminal()
+                        console.print(
+                            f"\n[red]Error:[/red] {exc}\n"
+                            "The app is still running. Please try again."
+                        )
             finally:
                 await agent_loop.close_mcp()
         

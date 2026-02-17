@@ -162,6 +162,49 @@ class MemoryFlushConfig(BaseModel):
     soft_threshold: int = 4_000
 
 
+class MemorySearchTiersConfig(BaseModel):
+    """Tier-level retrieval settings."""
+    enable_probe_on_off: bool = True
+    light_top_k: int = 3
+    heavy_top_k: int = 8
+    heavy_max_snippet_chars: int = 360
+    inject_budget_chars: int = 1800
+
+
+class MemorySearchRoutingConfig(BaseModel):
+    """Routing anchors and uncertain markers."""
+    explicit_anchors: list[str] = Field(
+        default_factory=lambda: [
+            "之前",
+            "上次",
+            "记得",
+            "你说过",
+            "我说过",
+            "按之前",
+            "查一下记录",
+        ]
+    )
+    uncertain_markers: list[str] = Field(
+        default_factory=lambda: ["可能", "大概", "我猜", "不确定", "记不清"]
+    )
+
+
+class MemorySearchTimeoutsConfig(BaseModel):
+    """Soft timeout targets (for observability/future enforcement)."""
+    probe_ms: int = 80
+    light_ms: int = 180
+    heavy_ms: int = 450
+
+
+class MemorySearchConfig(BaseModel):
+    """Lite memory retrieval configuration."""
+    enabled: bool = True
+    backend: str = "builtin_fts"  # builtin_fts | grep_only
+    tiers: MemorySearchTiersConfig = Field(default_factory=MemorySearchTiersConfig)
+    routing: MemorySearchRoutingConfig = Field(default_factory=MemorySearchRoutingConfig)
+    timeouts: MemorySearchTimeoutsConfig = Field(default_factory=MemorySearchTimeoutsConfig)
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
@@ -179,6 +222,7 @@ class AgentDefaults(BaseModel):
     tool_result_max_ratio: float = 0.10
     tool_result_truncation_notice: bool = True
     memory_flush: MemoryFlushConfig = Field(default_factory=MemoryFlushConfig)
+    memory_search: MemorySearchConfig = Field(default_factory=MemorySearchConfig)
     # PR-04: Outcome-driven execution limits
     max_turns_per_request: int = 12
     max_recovery_attempts: int = 4

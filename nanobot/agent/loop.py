@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from datetime import datetime
 import json
 import json_repair
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
-from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context import ContextBuilder, RetrievalTier
 from nanobot.agent.context_guard import (
     compute_context_limit,
     compute_tool_result_limit,
@@ -31,7 +32,7 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, guess_tldr, normalize_memory_type, normalize_tags
 from nanobot.agent.memory_flush import MemoryFlushTrigger
 from nanobot.agent.subagent import SubagentManager
 from nanobot.infra.error_types import NanobotRuntimeError, classify_error
@@ -55,6 +56,18 @@ class AgentLoop:
     4. Executes tool calls
     5. Sends responses back
     """
+    INTERNAL_FALLBACK_PREFIXES = (
+        "我已完成执行，但没有生成响应内容。",
+        "我已执行多轮操作但未能在限制内生成完整的响应。",
+        "I've completed processing but have no response to give.",
+        "I have executed multiple rounds but could not generate a complete response",
+    )
+    FORCED_ANSWER_BAD_PATTERNS = (
+        "do not apologize for not being able to finish",
+        "just give the best answer you can with what you have",
+        "tool iteration budget reached",
+        "do not call tools",
+    )
 
     def __init__(
         self,
@@ -87,6 +100,7 @@ class AgentLoop:
         memory_flush_enabled: bool = True,
         memory_flush_reserve_floor: int = 20_000,
         memory_flush_soft_threshold: int = 4_000,
+        memory_search_config: object | None = None,
         # PR-04: Outcome-driven execution limits
         max_turns_per_request: int = 12,
         max_recovery_attempts: int = 4,
@@ -125,7 +139,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, memory_search_config=memory_search_config)
         self.sessions = session_manager or SessionManager(workspace)
         self.memory_flush = MemoryFlushTrigger(
             workspace=workspace,
@@ -251,6 +265,73 @@ class AgentLoop:
         except Exception:
             return str(content)
 
+    @staticmethod
+    def _coerce_structured_memory_entry(
+        value: object,
+        *,
+        default_type: str,
+    ) -> dict[str, Any] | None:
+        """Normalize consolidation output into a structured memory entry."""
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            details = value.strip()
+            if not details:
+                return None
+            return {
+                "type": normalize_memory_type(default_type),
+                "tags": [],
+                "tldr": guess_tldr(details),
+                "details": details,
+            }
+
+        if isinstance(value, list):
+            details = "\n".join([str(item).strip() for item in value if str(item).strip()]).strip()
+            if not details:
+                return None
+            return {
+                "type": normalize_memory_type(default_type),
+                "tags": [],
+                "tldr": guess_tldr(details),
+                "details": details,
+            }
+
+        if not isinstance(value, dict):
+            details = str(value).strip()
+            if not details:
+                return None
+            return {
+                "type": normalize_memory_type(default_type),
+                "tags": [],
+                "tldr": guess_tldr(details),
+                "details": details,
+            }
+
+        entry_type = normalize_memory_type(str(value.get("type") or default_type))
+        tags = normalize_tags(value.get("tags"))
+        tldr = str(value.get("tldr") or value.get("tl;dr") or value.get("summary") or "").strip()
+        details = str(
+            value.get("details")
+            or value.get("content")
+            or value.get("memory_entry")
+            or value.get("daily_note")
+            or value.get("note")
+            or ""
+        ).strip()
+        if not details and tldr:
+            details = tldr
+        if not tldr and details:
+            tldr = guess_tldr(details)
+        if not details:
+            return None
+        return {
+            "type": entry_type,
+            "tags": tags,
+            "tldr": tldr,
+            "details": details,
+        }
+
     def _build_compaction_summary(self, messages: list[dict]) -> str:
         """Build a compact summary from dropped context messages."""
         if not messages:
@@ -307,6 +388,22 @@ class AgentLoop:
         """Compute usable token limit after reserve."""
         context_limit = compute_context_limit(self.model, self.context_window_tokens)
         return max(1, context_limit - self.context_reserve_tokens)
+
+    @classmethod
+    def _is_internal_fallback_response(cls, text: str | None) -> bool:
+        """Return True when text is one of built-in fallback replies."""
+        content = (text or "").strip()
+        if not content:
+            return False
+        return any(content.startswith(prefix) for prefix in cls.INTERNAL_FALLBACK_PREFIXES)
+
+    @classmethod
+    def _is_bad_forced_answer(cls, text: str | None) -> bool:
+        """Detect low-quality forced answers that simply echo instructions."""
+        content = (text or "").strip().lower()
+        if not content:
+            return True
+        return any(pattern in content for pattern in cls.FORCED_ANSWER_BAD_PATTERNS)
 
     def _compute_history_budget_tokens(self) -> int:
         """Compute history token budget from available context and configured ratio."""
@@ -645,7 +742,10 @@ class AgentLoop:
                 "请尝试重新表述您的问题，或者提供更多上下文信息。"
             ), tools_used
         elif final_outcome.kind == RunOutcomeKind.NO_REPLY:
-            # Max turns reached without terminal outcome
+            # Max turns reached without terminal outcome. Try one final no-tools synthesis pass.
+            forced = await self._attempt_forced_final_answer(messages, session_key=session_key)
+            if forced:
+                return forced, tools_used
             return (
                 "我已执行多轮操作但未能在限制内生成完整的响应。这可能是因为任务较复杂，"
                 "或者需要更多轮次的对话。请尝试：1) 提供更具体的指令；2) 将复杂任务拆分为多个简单问题；"
@@ -656,6 +756,83 @@ class AgentLoop:
             return final_outcome.payload, tools_used
         else:
             return None, tools_used
+
+    async def _attempt_forced_final_answer(
+        self,
+        messages: list[dict],
+        *,
+        session_key: str | None = None,
+    ) -> str | None:
+        """
+        Run one final model call without tools when tool loop budget is exhausted.
+
+        This prevents user-facing no-reply fallbacks for simple questions where
+        the model got stuck in iterative tool use.
+        """
+        if not messages:
+            return None
+
+        system_prompt = ""
+        if messages and messages[0].get("role") == "system":
+            system_prompt = str(messages[0].get("content") or "")
+
+        latest_user_question = ""
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                latest_user_question = content.strip()
+                break
+
+        if not latest_user_question:
+            latest_user_question = "Please provide the best final answer based on available context."
+
+        forced_messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Tool budget is exhausted. Answer the user's last question directly without tools.\n"
+                    "Use concise, practical steps in the same language as the user's question.\n\n"
+                    f"User question: {latest_user_question}"
+                ),
+            },
+        ]
+        available_limit = self._compute_available_context_limit()
+        forced_messages, _ = self._apply_runtime_token_pruning(forced_messages, available_limit)
+
+        try:
+            response = await self.provider.chat(
+                messages=forced_messages,
+                tools=None,
+                model=self.model,
+                temperature=min(self.temperature, 0.4),
+                max_tokens=self.max_tokens,
+            )
+            if typed_error := self._provider_error_from_response(response):
+                raise typed_error
+        except Exception as exc:
+            info = classify_error(exc)
+            logger.warning(
+                "Forced final answer failed: session={} kind={} error={}",
+                session_key or "unknown",
+                info.kind,
+                info.message[:240],
+            )
+            return None
+
+        content = (response.content or "").strip()
+        if self._is_bad_forced_answer(content):
+            logger.warning(
+                "Forced final answer looked like instruction echo, discard: session={}",
+                session_key or "unknown",
+            )
+            return None
+        return content
 
     async def _maybe_flush_memory(
         self,
@@ -714,6 +891,72 @@ class AgentLoop:
                 current_tokens,
             )
         return saved
+
+    async def _maybe_retry_with_upgraded_retrieval(
+        self,
+        *,
+        session: Session,
+        session_key: str,
+        current_message: str,
+        channel: str,
+        chat_id: str,
+        history_budget_tokens: int,
+        media: list[str] | None,
+        final_content: str | None,
+        tools_used: list[str],
+    ) -> tuple[str | None, list[str]]:
+        """
+        Retry once with higher retrieval tier when draft answer is uncertain.
+
+        Safety guard: skip this path when tools were already executed to avoid
+        repeating side-effecting tool calls.
+        """
+        if not final_content or tools_used:
+            return final_content, tools_used
+
+        current_retrieval = self.context.get_last_retrieval_result()
+        current_tier = current_retrieval.tier if current_retrieval else RetrievalTier.OFF
+        upgraded_tier = self.context.maybe_upgrade_retrieval_tier(final_content, current_tier)
+        if upgraded_tier <= current_tier:
+            return final_content, tools_used
+        if current_tier == RetrievalTier.OFF and (
+            current_retrieval is None or float(current_retrieval.probe_score) <= 0.0
+        ):
+            # For OFF tier, only retry when probe suggests memory may help.
+            return final_content, tools_used
+
+        logger.info(
+            "Upgrading memory retrieval tier for uncertain draft: session={} {}->{}",
+            session_key,
+            int(current_tier),
+            int(upgraded_tier),
+        )
+        retry_messages = self.context.build_messages(
+            history=session.get_history(
+                max_messages=self.memory_window,
+                max_tokens=history_budget_tokens,
+            ),
+            current_message=current_message,
+            media=media if media else None,
+            channel=channel,
+            chat_id=chat_id,
+            forced_retrieval_tier=upgraded_tier,
+        )
+        retry_content, retry_tools_used = await self._run_agent_loop(
+            retry_messages,
+            session_key=session_key,
+        )
+        if (
+            retry_content
+            and retry_content.strip()
+            and not self._is_internal_fallback_response(retry_content)
+        ):
+            return retry_content, retry_tools_used
+        logger.info(
+            "Retrieval retry returned fallback/empty response, keep original draft: session={}",
+            session_key,
+        )
+        return final_content, tools_used
 
 
     def _on_session_task_done(self, task: asyncio.Task[None]) -> None:
@@ -878,6 +1121,17 @@ class AgentLoop:
                 chat_id=msg.chat_id,
             )
         final_content, tools_used = await self._run_agent_loop(initial_messages, session_key=key)
+        final_content, tools_used = await self._maybe_retry_with_upgraded_retrieval(
+            session=session,
+            session_key=key,
+            current_message=msg.content,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            history_budget_tokens=history_budget_tokens,
+            media=msg.media if msg.media else None,
+            final_content=final_content,
+            tools_used=tools_used,
+        )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -944,7 +1198,18 @@ class AgentLoop:
                 channel=origin_channel,
                 chat_id=origin_chat_id,
             )
-        final_content, _ = await self._run_agent_loop(initial_messages, session_key=session_key)
+        final_content, tools_used = await self._run_agent_loop(initial_messages, session_key=session_key)
+        final_content, _ = await self._maybe_retry_with_upgraded_retrieval(
+            session=session,
+            session_key=session_key,
+            current_message=msg.content,
+            channel=origin_channel,
+            chat_id=origin_chat_id,
+            history_budget_tokens=history_budget_tokens,
+            media=None,
+            final_content=final_content,
+            tools_used=tools_used,
+        )
 
         if final_content is None:
             final_content = "Background task completed."
@@ -996,20 +1261,31 @@ class AgentLoop:
             lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
         conversation = "\n".join(lines)
         current_memory = memory.read_long_term()
+        today = datetime.now().strftime("%Y-%m-%d")
 
-        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
+        prompt = f"""You are a memory consolidation agent. Process this conversation and return one JSON object with keys:
 
-1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+1. "history_entry": paragraph summary for grep history (2-5 sentences), prefixed with [YYYY-MM-DD HH:MM].
+2. "memory_entry": object or null, with fields:
+   - type: decision|note|bug|idea|config
+   - tags: list[string] or comma-separated string
+   - tldr: one-sentence durable conclusion
+   - details: supporting details
+3. "daily_note": object or null, same fields as memory_entry.
 
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
+Rules:
+- memory_entry must focus on cross-session durable facts, constraints, decisions.
+- daily_note should capture today's progress/rationale.
+- If no durable memory exists, set memory_entry to null.
+- If no daily note exists, set daily_note to null.
+- Output ONLY valid JSON, no markdown fences.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
 ## Conversation to Process
 {conversation}
-
-Respond with ONLY valid JSON, no markdown fences."""
+"""
 
         try:
             response = await self.provider.chat(
@@ -1032,9 +1308,38 @@ Respond with ONLY valid JSON, no markdown fences."""
 
             if entry := result.get("history_entry"):
                 memory.append_history(entry)
-            if update := result.get("memory_update"):
-                if update != current_memory:
-                    memory.write_long_term(update)
+            memory_entry = self._coerce_structured_memory_entry(
+                result.get("memory_entry")
+                or result.get("memory")
+                or result.get("long_term"),
+                default_type="decision",
+            )
+            daily_note = self._coerce_structured_memory_entry(
+                result.get("daily_note")
+                or result.get("note"),
+                default_type="note",
+            )
+
+            # Backward compatibility: older consolidation may still return memory_update full text.
+            memory_update = result.get("memory_update")
+            if memory_entry:
+                memory.append_long_term_entry(
+                    memory_entry.get("details", ""),
+                    memory_type=str(memory_entry.get("type") or "note"),
+                    tags=memory_entry.get("tags"),
+                    tldr=str(memory_entry.get("tldr") or ""),
+                )
+            elif isinstance(memory_update, str) and memory_update.strip() and memory_update != current_memory:
+                memory.write_long_term(memory_update)
+
+            if daily_note:
+                memory.append_daily_note(
+                    today,
+                    str(daily_note.get("details") or ""),
+                    memory_type=str(daily_note.get("type") or "note"),
+                    tags=daily_note.get("tags"),
+                    tldr=str(daily_note.get("tldr") or ""),
+                )
 
             if archive_all:
                 session.last_consolidated = 0

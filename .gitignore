@@ -21,3 +21,6 @@ poetry.lock
 botpy.log
 tests/
 nanobot_upgradeplan.md
+CLAUDE.md
+nanobot.service
+/scripts/
