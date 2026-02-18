@@ -1,3 +1,4 @@
+from nanobot.agent.context import ContextBuilder
 from nanobot.agent.context_guard import (
     compute_context_limit,
     compute_tool_result_limit,
@@ -31,3 +32,45 @@ def test_compute_tool_result_limit_applies_ratio_and_max_chars() -> None:
     assert compute_tool_result_limit(limit=1000, ratio=0.1, max_chars=12000) == 400
     # hard cap by max_chars
     assert compute_tool_result_limit(limit=100000, ratio=0.5, max_chars=12000) == 12000
+
+
+def test_add_assistant_message_omits_empty_content_with_tool_calls() -> None:
+    builder = object.__new__(ContextBuilder)
+    messages: list[dict] = []
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "echo", "arguments": "{}"},
+        }
+    ]
+
+    builder.add_assistant_message(messages, content="", tool_calls=tool_calls)
+    msg = messages[-1]
+
+    assert msg["role"] == "assistant"
+    assert "content" not in msg
+    assert msg["tool_calls"] == tool_calls
+
+
+def test_add_assistant_message_keeps_non_empty_content() -> None:
+    builder = object.__new__(ContextBuilder)
+    messages: list[dict] = []
+
+    builder.add_assistant_message(messages, content="done")
+    msg = messages[-1]
+
+    assert msg["role"] == "assistant"
+    assert msg["content"] == "done"
+
+
+def test_add_assistant_message_keeps_reasoning_without_content() -> None:
+    builder = object.__new__(ContextBuilder)
+    messages: list[dict] = []
+
+    builder.add_assistant_message(messages, content=None, reasoning_content="analysis")
+    msg = messages[-1]
+
+    assert msg["role"] == "assistant"
+    assert "content" not in msg
+    assert msg["reasoning_content"] == "analysis"

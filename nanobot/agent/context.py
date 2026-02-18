@@ -627,7 +627,10 @@ To recall past events, use retrieval records and cite source file/date when rele
         Returns:
             Updated message list.
         """
-        msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
+        msg: dict[str, Any] = {"role": "assistant"}
+
+        if content:
+            msg["content"] = content
 
         if tool_calls:
             msg["tool_calls"] = tool_calls
