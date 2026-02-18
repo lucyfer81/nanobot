@@ -22,6 +22,11 @@ warnings.filterwarnings(
 )
 
 try:
+    import rjieba  # type: ignore
+except Exception:  # pragma: no cover - optional runtime dependency fallback
+    rjieba = None  # type: ignore[assignment]
+
+try:
     import jieba  # type: ignore
 except Exception:  # pragma: no cover - optional runtime dependency fallback
     jieba = None  # type: ignore[assignment]
@@ -508,7 +513,7 @@ class MemoryRetriever:
             if len(normalized) >= 2:
                 tokens.append(normalized)
 
-        # Segment contiguous CJK blocks with jieba; fallback to 2-gram.
+        # Segment contiguous CJK blocks with rjieba/jieba; fallback to 2-gram.
         for block in CJK_BLOCK_RE.findall(text):
             block = block.strip()
             if not block:
@@ -540,6 +545,20 @@ class MemoryRetriever:
         if not clean:
             return []
 
+        if rjieba is not None:
+            try:
+                pieces = [
+                    token.strip()
+                    for token in rjieba.cut(clean, False)  # type: ignore[union-attr]
+                    if token and token.strip()
+                ]
+                # Drop noisy single-char tokens; keep meaningful multi-char words.
+                segmented = [token for token in pieces if len(token) >= 2]
+                if segmented:
+                    return segmented
+            except Exception:
+                pass
+
         if jieba is not None:
             try:
                 pieces = [
@@ -554,7 +573,7 @@ class MemoryRetriever:
             except Exception:
                 pass
 
-        # Fallback: 2-gram segmentation for CJK when jieba is unavailable.
+        # Fallback: 2-gram segmentation for CJK when segmenters are unavailable.
         if len(clean) <= 2:
             return [clean]
         return [clean[idx : idx + 2] for idx in range(0, len(clean) - 1)]
