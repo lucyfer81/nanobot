@@ -2,6 +2,7 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.loader import convert_keys, convert_to_camel
 
 
 class SampleTool(Tool):
@@ -86,3 +87,74 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+def test_convert_keys_preserves_mcp_server_and_env_keys() -> None:
+    raw = {
+        "tools": {
+            "mcpServers": {
+                "MyServer": {
+                    "command": "npx",
+                    "env": {
+                        "OPENAI_API_KEY": "secret",
+                        "MixedCaseKey": "value",
+                    },
+                }
+            },
+            "restrictToWorkspace": True,
+        }
+    }
+
+    converted = convert_keys(raw)
+
+    assert "mcp_servers" in converted["tools"]
+    assert "MyServer" in converted["tools"]["mcp_servers"]
+    assert converted["tools"]["mcp_servers"]["MyServer"]["env"]["OPENAI_API_KEY"] == "secret"
+    assert converted["tools"]["mcp_servers"]["MyServer"]["env"]["MixedCaseKey"] == "value"
+    assert "restrict_to_workspace" in converted["tools"]
+
+
+def test_convert_to_camel_preserves_mcp_server_and_env_keys() -> None:
+    snake = {
+        "tools": {
+            "mcp_servers": {
+                "MyServer": {
+                    "command": "npx",
+                    "env": {
+                        "OPENAI_API_KEY": "secret",
+                        "MixedCaseKey": "value",
+                    },
+                }
+            },
+            "restrict_to_workspace": False,
+        }
+    }
+
+    converted = convert_to_camel(snake)
+
+    assert "mcpServers" in converted["tools"]
+    assert "MyServer" in converted["tools"]["mcpServers"]
+    assert converted["tools"]["mcpServers"]["MyServer"]["env"]["OPENAI_API_KEY"] == "secret"
+    assert converted["tools"]["mcpServers"]["MyServer"]["env"]["MixedCaseKey"] == "value"
+    assert "restrictToWorkspace" in converted["tools"]
+
+
+def test_round_trip_keeps_mcp_env_keys_unchanged() -> None:
+    raw = {
+        "tools": {
+            "mcpServers": {
+                "Server-A": {
+                    "command": "uvx",
+                    "env": {
+                        "OPENAI_API_KEY": "x",
+                        "AZURE_OPENAI_API_KEY": "y",
+                    },
+                }
+            }
+        }
+    }
+
+    round_tripped = convert_to_camel(convert_keys(raw))
+    env = round_tripped["tools"]["mcpServers"]["Server-A"]["env"]
+
+    assert env == raw["tools"]["mcpServers"]["Server-A"]["env"]

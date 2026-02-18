@@ -159,21 +159,44 @@ def _apply_env_overrides(config: Config) -> None:
         config.tools.web.search.api_key = brave_api_key
 
 
-def convert_keys(data: Any) -> Any:
+def _is_mcp_server_map_path(path: tuple[str, ...]) -> bool:
+    return len(path) == 2 and path[0] == "tools" and path[1] in {"mcp_servers", "mcpServers"}
+
+
+def _is_mcp_env_path(path: tuple[str, ...]) -> bool:
+    return (
+        len(path) == 4
+        and path[0] == "tools"
+        and path[1] in {"mcp_servers", "mcpServers"}
+        and path[3] == "env"
+    )
+
+
+def convert_keys(data: Any, _path: tuple[str, ...] = ()) -> Any:
     """Convert camelCase keys to snake_case for Pydantic."""
     if isinstance(data, dict):
-        return {camel_to_snake(k): convert_keys(v) for k, v in data.items()}
+        converted: dict[str, Any] = {}
+        keep_keys = _is_mcp_server_map_path(_path) or _is_mcp_env_path(_path)
+        for k, v in data.items():
+            key = k if keep_keys else camel_to_snake(k)
+            converted[key] = convert_keys(v, _path + (key,))
+        return converted
     if isinstance(data, list):
-        return [convert_keys(item) for item in data]
+        return [convert_keys(item, _path) for item in data]
     return data
 
 
-def convert_to_camel(data: Any) -> Any:
+def convert_to_camel(data: Any, _path: tuple[str, ...] = ()) -> Any:
     """Convert snake_case keys to camelCase."""
     if isinstance(data, dict):
-        return {snake_to_camel(k): convert_to_camel(v) for k, v in data.items()}
+        converted: dict[str, Any] = {}
+        keep_keys = _is_mcp_server_map_path(_path) or _is_mcp_env_path(_path)
+        for k, v in data.items():
+            key = k if keep_keys else snake_to_camel(k)
+            converted[key] = convert_to_camel(v, _path + (key,))
+        return converted
     if isinstance(data, list):
-        return [convert_to_camel(item) for item in data]
+        return [convert_to_camel(item, _path) for item in data]
     return data
 
 
